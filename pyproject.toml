@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apple-instruments-mcp"
+version = "1.0.0"
+description = "MCP server for Apple platform profiling via xctrace/Instruments"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Diogo Autilio", email = "diautilio@gmail.com" }]
+keywords = [
+  "mcp",
+  "model-context-protocol",
+  "instruments",
+  "xctrace",
+  "profiling",
+  "ios",
+  "macos",
+  "performance",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Debuggers",
+  "Topic :: System :: Monitoring",
+  "Typing :: Typed",
+]
+dependencies = [
+  "mcp>=1.0.0",
+  "pydantic>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/dogo/apple-instruments-mcp"
+Repository = "https://github.com/dogo/apple-instruments-mcp"
+Issues = "https://github.com/dogo/apple-instruments-mcp/issues"
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6",
+  "pyright>=1.1.380",
+]
+
+[project.scripts]
+apple-instruments-mcp = "apple_instruments_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apple_instruments_mcp"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
