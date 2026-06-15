@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2 - 2026-06-15
+
+- Restored analysis against real `xctrace` XML exports after validating physical-device traces.
+- Added validated Allocations and Leaks parsers for the exported Instruments detail rows.
+- Added Network trace analysis for `network-connection-detected` socket-level rows when HTTP/HAR task details are absent.
+- Updated parser status documentation and regression coverage for the validated trace shapes.
+
 ## 1.0.1 - 2026-06-15
 
 - Fixed generated `xcrun xctrace record --output` paths to use `.trace`, which current Xcode versions require for recording.

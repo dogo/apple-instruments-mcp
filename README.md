@@ -64,7 +64,7 @@ The simplest config uses `uvx`, so the client launches the server on demand with
 }
 ```
 
-To pin a specific version, replace the arg with `apple-instruments-mcp@1.0.1`.
+To pin a specific version, replace the arg with `apple-instruments-mcp@1.0.2`.
 
 For Claude Code:
 
