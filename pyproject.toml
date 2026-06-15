@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "apple-instruments-mcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "MCP server for Apple platform profiling via xctrace/Instruments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,6 +42,7 @@ dependencies = [
 Homepage = "https://github.com/dogo/apple-instruments-mcp"
 Repository = "https://github.com/dogo/apple-instruments-mcp"
 Issues = "https://github.com/dogo/apple-instruments-mcp/issues"
+Changelog = "https://github.com/dogo/apple-instruments-mcp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
