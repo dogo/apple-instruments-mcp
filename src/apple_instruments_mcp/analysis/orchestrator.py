@@ -101,11 +101,12 @@ async def run_analysis(
             ]
         )
 
+    preflight_timings: dict[str, float] | None = None
     if target.device_id and target.bundle_id:
-        preflight_findings = await preflight_ios_target(target.device_id, target.bundle_id)
-        blockers = [finding for finding in preflight_findings if finding.severity == "blocker"]
-        if blockers:
-            return format_preflight_findings(template, target.label, blockers)
+        report = await preflight_ios_target(target.device_id, target.bundle_id)
+        preflight_timings = report.timings
+        if report.blockers:
+            return format_preflight_findings(template, target.label, report.blockers)
 
     if base_dir:
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -146,7 +147,13 @@ async def run_analysis(
     except Exception as error:
         record_failed = True
         partial_trace = trace_path if trace_path.exists() else None
-        return format_target_error(target, template, str(error), partial_trace=partial_trace)
+        return format_target_error(
+            target,
+            template,
+            str(error),
+            partial_trace=partial_trace,
+            preflight_timings=preflight_timings,
+        )
     finally:
         if not keep_trace and not record_failed:
             shutil.rmtree(tmp_dir, ignore_errors=True)

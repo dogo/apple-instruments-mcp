@@ -120,18 +120,80 @@ class RecordingTarget:
         return errors
 
 
+def _format_preflight_timings(timings: dict[str, float] | None) -> list[str]:
+    if not timings:
+        return []
+    lines = ["- Pre-flight probes (all passed, durations):"]
+    for name, seconds in timings.items():
+        lines.append(f"  - `{name}`: {seconds * 1000:.0f} ms")
+    return lines
+
+
+def _append_partial_trace_note(lines: list[str], partial_trace: Path | None) -> None:
+    if partial_trace is None:
+        return
+    try:
+        size = sum(p.stat().st_size for p in partial_trace.rglob("*") if p.is_file())
+        lines.append(f"- Partial trace bundle preserved at `{partial_trace}` ({size} bytes).")
+    except OSError:
+        lines.append(f"- Partial trace bundle preserved at `{partial_trace}`.")
+
+
 def format_target_error(
     target: RecordingTarget,
     template: str,
     error: str,
     *,
     partial_trace: Path | None = None,
+    preflight_timings: dict[str, float] | None = None,
 ) -> str:
     msg = error.lower()
     lines = [f"Error profiling with template '{template}' against {target.label}: {error}", ""]
 
+    started_but_unfinished = "started recording but did not finish" in msg
+    never_started = "did not begin recording within" in msg
+
+    if started_but_unfinished:
+        lines.append(
+            "xctrace announced `Starting recording` but never finished within the time limit."
+        )
+        lines.extend(_format_preflight_timings(preflight_timings))
+        if target.bundle_id and target.device_id:
+            lines.extend(
+                [
+                    "- This is a runtime wedge AFTER the simulator accepted the launch — preflight passed.",
+                    "- The Instruments daemon (or DTServiceHub on the simulator) is the likely culprit.",
+                    f"- Reboot the simulator: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
+                    "- If reboot doesn't help: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
+                    "- As a last resort, open Instruments.app once to reset the tracing layer.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- The target process or instrument server stopped making progress mid-recording.",
+                    "- Confirm the workload finishes on its own; the recording mirrors the workload's runtime.",
+                ]
+            )
+        _append_partial_trace_note(lines, partial_trace)
+        return "\n".join(lines)
+
+    if never_started:
+        lines.append("xctrace never reported `Starting recording`.")
+        lines.extend(_format_preflight_timings(preflight_timings))
+        lines.append("- xctrace itself or its IPC channel appears wedged before the session started.")
+        lines.append("- Try: `pkill -9 xctrace` then retry.")
+        if target.bundle_id and target.device_id:
+            lines.append(
+                f"- If persistent: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`."
+            )
+        lines.append("- If still failing, open Instruments.app once to reset the tracing layer.")
+        _append_partial_trace_note(lines, partial_trace)
+        return "\n".join(lines)
+
     if "timed out" in msg or "timeout" in msg:
         lines.append("xctrace did not finish before the wrapper timeout.")
+        lines.extend(_format_preflight_timings(preflight_timings))
         if target.bundle_id and target.device_id:
             lines.extend(
                 [
@@ -148,12 +210,7 @@ def format_target_error(
                     "- Confirm the target process is making forward progress.",
                 ]
             )
-        if partial_trace is not None:
-            try:
-                size = sum(p.stat().st_size for p in partial_trace.rglob("*") if p.is_file())
-                lines.append(f"- Partial trace bundle preserved at `{partial_trace}` ({size} bytes).")
-            except OSError:
-                lines.append(f"- Partial trace bundle preserved at `{partial_trace}`.")
+        _append_partial_trace_note(lines, partial_trace)
         return "\n".join(lines)
 
     bundle_missing = ("not installed" in msg or "could not find application" in msg) and target.bundle_id

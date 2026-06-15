@@ -28,8 +28,14 @@ from apple_instruments_mcp.analysis import (
 from apple_instruments_mcp.analysis import xctrace as xctrace_module
 from apple_instruments_mcp.analysis.xctrace import (
     PreflightFinding,
+    PreflightReport,
+    _run_record_with_watchdog,
+    _watchdog_loop,
+    find_stale_xctrace_pids,
     format_preflight_findings,
+    kill_stale_xctrace_processes,
     preflight_ios_target,
+    probe_xctrace_health,
 )
 
 
@@ -810,97 +816,144 @@ class FormatTargetErrorTests(unittest.TestCase):
             self.assertIn("Partial trace bundle preserved", output)
 
 
+def _is_xctrace_probe(args: tuple[str, ...]) -> bool:
+    return "xctrace" in args and "list" in args
+
+
+def _is_simctl_list(args: tuple[str, ...]) -> bool:
+    return "simctl" in args and "list" in args
+
+
 class PreflightIosTargetTests(unittest.TestCase):
     def _patch_run(self, side_effect):
         return mock.patch.object(xctrace_module, "run_command", side_effect=side_effect)
 
     def test_returns_empty_when_device_not_in_simctl_list(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
+            if _is_xctrace_probe(args):
+                return ""
             return json.dumps({"devices": {"runtime": [{"udid": "OTHER", "state": "Booted"}]}})
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
 
-        self.assertEqual(findings, [])
+        self.assertEqual(report.findings, [])
+        self.assertIn("xctrace_list_devices", report.timings)
+        self.assertIn("simctl_list_devices", report.timings)
 
     def test_blocks_when_simulator_not_booted(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
+            if _is_xctrace_probe(args):
+                return ""
             return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Shutdown"}]}})
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
 
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "blocker")
-        self.assertIn("not Booted", findings[0].message)
-        self.assertTrue(any("simctl boot SIM-123" in h for h in findings[0].hints))
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "blocker")
+        self.assertIn("not Booted", report.findings[0].message)
+        self.assertTrue(any("simctl boot SIM-123" in h for h in report.findings[0].hints))
 
     def test_passes_when_simulator_booted_and_app_installed(self) -> None:
         calls: list[tuple[str, ...]] = []
 
         async def fake(*args, **kwargs):  # noqa: ARG001
             calls.append(args)
-            if "list" in args:
+            if _is_xctrace_probe(args):
+                return ""
+            if _is_simctl_list(args):
                 return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Booted"}]}})
             return "/Users/.../App.app\n"
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
 
-        self.assertEqual(findings, [])
-        self.assertEqual(len(calls), 2)
-        self.assertIn("get_app_container", calls[1])
+        self.assertEqual(report.findings, [])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(_is_xctrace_probe(calls[0]))
+        self.assertIn("get_app_container", calls[2])
+        self.assertEqual(
+            set(report.timings),
+            {"xctrace_list_devices", "simctl_list_devices", "simctl_get_app_container"},
+        )
 
     def test_blocks_when_app_not_installed(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
-            if "list" in args:
+            if _is_xctrace_probe(args):
+                return ""
+            if _is_simctl_list(args):
                 return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Booted"}]}})
             raise RuntimeError("No such app com.example.app on device")
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
 
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "blocker")
-        self.assertIn("is not installed", findings[0].message)
-        self.assertTrue(any("simctl listapps SIM-123" in h for h in findings[0].hints))
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "blocker")
+        self.assertIn("is not installed", report.findings[0].message)
+        self.assertTrue(any("simctl listapps SIM-123" in h for h in report.findings[0].hints))
 
     def test_blocks_when_coresim_wedged_on_get_app_container(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
-            if "list" in args:
+            if _is_xctrace_probe(args):
+                return ""
+            if _is_simctl_list(args):
                 return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Booted"}]}})
             raise RuntimeError("Command timed out: xcrun simctl get_app_container ...")
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
 
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "blocker")
-        self.assertIn("CoreSimulator did not respond", findings[0].message)
-        self.assertTrue(any("killall -9 com.apple.CoreSimulator" in h for h in findings[0].hints))
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "blocker")
+        self.assertIn("CoreSimulator did not respond", report.findings[0].message)
+        self.assertTrue(any("killall -9 com.apple.CoreSimulator" in h for h in report.findings[0].hints))
 
     def test_blocks_when_simctl_list_itself_times_out(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
+            if _is_xctrace_probe(args):
+                return ""
             raise RuntimeError("Command timed out: xcrun simctl list devices -j")
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
 
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "blocker")
-        self.assertIn("did not respond to `simctl list devices`", findings[0].message)
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "blocker")
+        self.assertIn("did not respond to `simctl list devices`", report.findings[0].message)
 
     def test_udid_lookup_is_case_insensitive(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
-            if "list" in args:
+            if _is_xctrace_probe(args):
+                return ""
+            if _is_simctl_list(args):
                 return json.dumps({"devices": {"r": [{"udid": "AFF97D0A-AAAA", "state": "Shutdown"}]}})
             return ""
 
         with self._patch_run(fake):
-            findings = asyncio.run(preflight_ios_target("aff97d0a-aaaa", "com.example.app"))
+            report = asyncio.run(preflight_ios_target("aff97d0a-aaaa", "com.example.app"))
 
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "blocker")
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "blocker")
+
+    def test_blocks_immediately_when_xctrace_probe_times_out(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            calls.append(args)
+            if _is_xctrace_probe(args):
+                raise RuntimeError("Command timed out: xcrun xctrace list devices")
+            raise AssertionError("simctl should not be called after xctrace probe blocker")
+
+        with self._patch_run(fake):
+            report = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(report.findings[0].severity, "blocker")
+        self.assertIn("xctrace list devices", report.findings[0].message)
+        self.assertTrue(any("pkill -9 xctrace" in h for h in report.findings[0].hints))
 
     def test_format_preflight_findings_includes_hints(self) -> None:
         findings = [
@@ -917,6 +970,346 @@ class PreflightIosTargetTests(unittest.TestCase):
         self.assertIn("com.example.app", output)
         self.assertIn("Simulator SIM-X", output)
         self.assertIn("Boot first", output)
+
+
+class ProbeXctraceHealthTests(unittest.TestCase):
+    def test_returns_none_when_xctrace_responds(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            return "== Devices ==\n"
+
+        with mock.patch.object(xctrace_module, "run_command", side_effect=fake):
+            finding = asyncio.run(probe_xctrace_health())
+
+        self.assertIsNone(finding)
+
+    def test_returns_blocker_when_xctrace_times_out(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError("Command timed out: xcrun xctrace list devices")
+
+        with mock.patch.object(xctrace_module, "run_command", side_effect=fake):
+            finding = asyncio.run(probe_xctrace_health())
+
+        assert finding is not None
+        self.assertEqual(finding.severity, "blocker")
+        self.assertIn("xctrace list devices", finding.message)
+        self.assertTrue(any("pkill -9 xctrace" in h for h in finding.hints))
+        self.assertTrue(any("Instruments.app" in h for h in finding.hints))
+
+    def test_returns_warning_on_non_timeout_failure(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError("xcrun: error: invalid active developer path")
+
+        with mock.patch.object(xctrace_module, "run_command", side_effect=fake):
+            finding = asyncio.run(probe_xctrace_health())
+
+        assert finding is not None
+        self.assertEqual(finding.severity, "warning")
+        self.assertIn("invalid active developer path", finding.message)
+
+
+class StaleXctraceProcessCleanupTests(unittest.TestCase):
+    def test_find_stale_pids_returns_empty_when_pgrep_finds_none(self) -> None:
+        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
+            return 1, ""  # pgrep exit 1 = no matches
+
+        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
+            pids = asyncio.run(find_stale_xctrace_pids())
+
+        self.assertEqual(pids, [])
+
+    def test_find_stale_pids_parses_pgrep_output(self) -> None:
+        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
+            return 0, "1234\n5678\n"
+
+        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
+            pids = asyncio.run(find_stale_xctrace_pids())
+
+        self.assertEqual(pids, [1234, 5678])
+
+    def test_find_stale_pids_ignores_unexpected_exit_codes(self) -> None:
+        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
+            return -1, ""  # timeout sentinel
+
+        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
+            pids = asyncio.run(find_stale_xctrace_pids())
+
+        self.assertEqual(pids, [])
+
+    def test_kill_stale_returns_zero_when_none_found(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
+            calls.append(args)
+            return 1, ""  # pgrep finds nothing
+
+        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
+            killed = asyncio.run(kill_stale_xctrace_processes())
+
+        self.assertEqual(killed, 0)
+        self.assertEqual(len(calls), 1)  # pgrep only, no kill issued
+        self.assertEqual(calls[0][0], "pgrep")
+
+    def test_kill_stale_invokes_kill_dash_9_for_found_pids(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
+            calls.append(args)
+            if args[0] == "pgrep":
+                return 0, "111\n222\n"
+            return 0, ""
+
+        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
+            killed = asyncio.run(kill_stale_xctrace_processes())
+
+        self.assertEqual(killed, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], ("kill", "-9", "111", "222"))
+
+
+class RecordTraceCleanupTests(unittest.TestCase):
+    def test_record_trace_sweeps_before_and_after_on_failure(self) -> None:
+        sweep_calls: list[str] = []
+        record_called = False
+
+        async def fake_kill():
+            sweep_calls.append("sweep")
+            return 0
+
+        async def fake_record(*args, **kwargs):  # noqa: ARG001
+            nonlocal record_called
+            record_called = True
+            raise RuntimeError("xctrace started recording but did not finish within 10s + 15s grace.")
+
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        with (
+            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
+            mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(xctrace_module.record_trace("App Launch", target, 10, Path(tmp) / "t.trace"))
+
+        self.assertTrue(record_called)
+        self.assertEqual(sweep_calls, ["sweep", "sweep"])
+
+    def test_record_trace_sweeps_only_before_on_success(self) -> None:
+        sweep_calls: list[str] = []
+
+        async def fake_kill():
+            sweep_calls.append("sweep")
+            return 0
+
+        async def fake_record(*args, **kwargs):  # noqa: ARG001
+            return None
+
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        with (
+            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
+            mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            asyncio.run(xctrace_module.record_trace("App Launch", target, 10, Path(tmp) / "t.trace"))
+
+        self.assertEqual(sweep_calls, ["sweep"])
+
+
+class _FakeStream:
+    def __init__(self, script: list[tuple[float, bytes]]) -> None:
+        # script: list of (delay_seconds, line_bytes). An empty bytes ends the stream.
+        self._script = list(script)
+
+    async def readline(self) -> bytes:
+        if not self._script:
+            await asyncio.sleep(60)  # block; tests should never get here
+            return b""
+        delay, line = self._script.pop(0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return line
+
+
+class _FakeProcess:
+    def __init__(self, script: list[tuple[float, bytes]], returncode: int = 0) -> None:
+        self.stdout = _FakeStream(script)
+        self.returncode: int | None = None
+        self._wait_event = asyncio.Event()
+        self._final_returncode = returncode
+        self.kill_called = False
+
+    def kill(self) -> None:
+        self.kill_called = True
+        self.returncode = -9
+        self._wait_event.set()
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            # The reader is what drives the lifecycle; once EOF is reached, mark exit.
+            # In tests we set returncode either via kill() or by letting the watchdog finish.
+            await self._wait_event.wait()
+        return self.returncode if self.returncode is not None else self._final_returncode
+
+    def finish_naturally(self) -> None:
+        self.returncode = self._final_returncode
+        self._wait_event.set()
+
+
+class WatchdogLoopTests(unittest.TestCase):
+    def _run(self, process: _FakeProcess, **overrides) -> None:
+        kwargs = dict(
+            time_limit_seconds=1,
+            startup_timeout=2.0,
+            teardown_grace=2.0,
+            poll_interval=0.05,
+        )
+        kwargs.update(overrides)
+
+        async def driver() -> None:
+            task = asyncio.create_task(_watchdog_loop(process, **kwargs))
+            # Wait for the reader to drain the script, then signal natural exit.
+            await asyncio.sleep(0.4)
+            if not task.done():
+                process.finish_naturally()
+            await task
+
+        asyncio.run(driver())
+
+    def test_happy_path_completes_when_process_exits_cleanly(self) -> None:
+        process = _FakeProcess(
+            [
+                (0.0, b"Starting recording with Time Profiler.\n"),
+                (0.05, b"Time limit: 1.0 s\n"),
+                (0.1, b"Recording finished.\n"),
+                (0.0, b""),
+            ]
+        )
+
+        self._run(process)
+        self.assertFalse(process.kill_called)
+
+    def test_kills_when_starting_recording_never_appears(self) -> None:
+        process = _FakeProcess(
+            [
+                (0.0, b"some unrelated noise\n"),
+                # never prints "Starting recording" and never EOFs
+            ]
+        )
+
+        async def driver() -> None:
+            with self.assertRaises(RuntimeError) as ctx:
+                await _watchdog_loop(
+                    process,
+                    time_limit_seconds=1,
+                    startup_timeout=0.3,
+                    teardown_grace=10.0,
+                    poll_interval=0.05,
+                )
+            self.assertIn("did not begin recording", str(ctx.exception))
+
+        asyncio.run(driver())
+        self.assertTrue(process.kill_called)
+
+    def test_kills_when_recording_started_but_never_finishes(self) -> None:
+        process = _FakeProcess(
+            [
+                (0.0, b"Starting recording with Time Profiler.\n"),
+                (0.05, b"Time limit: 1.0 s\n"),
+                # never prints "Recording finished" and never EOFs
+            ]
+        )
+
+        async def driver() -> None:
+            with self.assertRaises(RuntimeError) as ctx:
+                await _watchdog_loop(
+                    process,
+                    time_limit_seconds=1,
+                    startup_timeout=10.0,
+                    teardown_grace=0.3,
+                    poll_interval=0.05,
+                )
+            self.assertIn("started recording but did not finish", str(ctx.exception))
+            self.assertIn("Time limit: 1.0 s", str(ctx.exception))
+
+        asyncio.run(driver())
+        self.assertTrue(process.kill_called)
+
+    def test_propagates_nonzero_exit_with_captured_output(self) -> None:
+        process = _FakeProcess(
+            [
+                (0.0, b"Starting recording.\n"),
+                (0.05, b"xctrace: error: template not found\n"),
+                (0.0, b""),
+            ],
+            returncode=1,
+        )
+
+        async def driver() -> None:
+            task = asyncio.create_task(
+                _watchdog_loop(
+                    process,
+                    time_limit_seconds=1,
+                    startup_timeout=2.0,
+                    teardown_grace=2.0,
+                    poll_interval=0.05,
+                )
+            )
+            await asyncio.sleep(0.3)
+            process.finish_naturally()
+            with self.assertRaises(RuntimeError) as ctx:
+                await task
+            self.assertIn("template not found", str(ctx.exception))
+
+        asyncio.run(driver())
+
+
+class FormatTargetErrorRecordingWedgeTests(unittest.TestCase):
+    def test_started_but_unfinished_calls_out_runtime_wedge(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        output = format_target_error(
+            target,
+            "App Launch",
+            "xctrace started recording but did not finish within 5s + 15s grace. Last output: Time limit: 5.0 s",
+        )
+
+        self.assertIn("announced `Starting recording`", output)
+        self.assertIn("runtime wedge", output)
+        self.assertIn("simctl shutdown SIM-123", output)
+        self.assertIn("DTServiceHub", output)
+
+    def test_never_started_message_suggests_pkill_xctrace(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        output = format_target_error(
+            target,
+            "App Launch",
+            "xctrace did not begin recording within 15s (never reported `Starting recording`).",
+        )
+
+        self.assertIn("never reported `Starting recording`", output)
+        self.assertIn("pkill -9 xctrace", output)
+        self.assertIn("simctl shutdown SIM-123", output)
+
+    def test_preflight_timings_are_rendered_when_provided(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        output = format_target_error(
+            target,
+            "App Launch",
+            "xctrace started recording but did not finish within 5s + 15s grace.",
+            preflight_timings={
+                "xctrace_list_devices": 1.412,
+                "simctl_list_devices": 0.081,
+                "simctl_get_app_container": 0.103,
+            },
+        )
+
+        self.assertIn("Pre-flight probes", output)
+        self.assertIn("xctrace_list_devices", output)
+        self.assertIn("1412 ms", output)
+        self.assertIn("simctl_get_app_container", output)
+        self.assertIn("103 ms", output)
 
 
 if __name__ == "__main__":
