@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.4 - 2026-06-15
+
+- Replaced the blunt `time_limit + 30s` wall timeout on `xctrace record` with a streaming watchdog that bails out within `time_limit + 15s` grace when xctrace announces `Starting recording` but never finishes — the post-launch runtime wedge case where the 1.0.3 pre-flight already passed.
+- Added a separate 15s startup timeout for the case where xctrace itself never reaches `Starting recording`, with a distinct diagnosis that suggests `pkill -9 xctrace`.
+- Pre-flight now records per-probe wall-clock durations and surfaces them in the failure diagnostic so it's obvious which probes passed before the record-time wedge.
+- Preserved the last line of xctrace's stdout in the error message so DTServiceHub-style runtime wedges are diagnosable from the response alone.
+
 ## 1.0.3 - 2026-06-15
 
 - Fixed `profile_ios_app` and other iOS tools hanging ~40s with a generic `Command timed out` when CoreSimulator is wedged. Added a fast pre-flight (`simctl list devices` + `simctl get_app_container`, 5s each) that short-circuits with a specific diagnosis for wedged CoreSimulator, non-booted simulator, or missing app — including the exact recovery commands.
