@@ -4,9 +4,12 @@ import asyncio
 import json
 import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 
 from apple_instruments_mcp.analysis.targets import RecordingTarget
+
+PREFLIGHT_TIMEOUT_SECONDS = 5.0
 
 
 async def run_command(*args: str, timeout: float | None = None) -> str:
@@ -102,6 +105,125 @@ async def record_trace(
     timeout = time_limit_seconds + 30
     args = build_record_command(template, target, time_limit_seconds, output_path)
     await run_command(*args, timeout=timeout)
+
+
+@dataclass(frozen=True)
+class PreflightFinding:
+    severity: str  # "blocker" | "warning"
+    message: str
+    hints: tuple[str, ...] = ()
+
+
+def _find_simulator_state(simctl_json: str, device_id: str) -> str | None:
+    """Return the boot state for device_id from `simctl list devices -j` output, or None if not a simulator."""
+    try:
+        payload = json.loads(simctl_json)
+    except json.JSONDecodeError:
+        return None
+    target_udid = device_id.lower()
+    for entries in (payload.get("devices") or {}).values():
+        for entry in entries or []:
+            if str(entry.get("udid", "")).lower() == target_udid:
+                return str(entry.get("state", "Unknown"))
+    return None
+
+
+async def preflight_ios_target(device_id: str, bundle_id: str) -> list[PreflightFinding]:
+    """Pre-flight an iOS simulator target before xctrace record.
+
+    Returns findings the caller should surface. Physical devices (not in simctl list) return [].
+    """
+    findings: list[PreflightFinding] = []
+
+    try:
+        simctl_output = await run_command(
+            "xcrun", "simctl", "list", "devices", "-j", timeout=PREFLIGHT_TIMEOUT_SECONDS
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "timed out" in message.lower():
+            findings.append(
+                PreflightFinding(
+                    "blocker",
+                    "CoreSimulator did not respond to `simctl list devices` within "
+                    f"{int(PREFLIGHT_TIMEOUT_SECONDS)}s.",
+                    (
+                        "The CoreSimulator service is likely wedged.",
+                        "Try: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
+                    ),
+                )
+            )
+        else:
+            findings.append(PreflightFinding("warning", f"`simctl list devices` failed: {message}"))
+        return findings
+
+    state = _find_simulator_state(simctl_output, device_id)
+    if state is None:
+        return []  # not a simulator (likely physical device); skip simctl checks
+
+    if state != "Booted":
+        findings.append(
+            PreflightFinding(
+                "blocker",
+                f"Simulator {device_id} is in state '{state}', not Booted.",
+                (f"Boot first: `xcrun simctl boot {device_id}`",),
+            )
+        )
+        return findings
+
+    try:
+        await run_command(
+            "xcrun",
+            "simctl",
+            "get_app_container",
+            device_id,
+            bundle_id,
+            "app",
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if "timed out" in lowered:
+            findings.append(
+                PreflightFinding(
+                    "blocker",
+                    f"CoreSimulator did not respond to `simctl get_app_container {device_id} {bundle_id}` "
+                    f"within {int(PREFLIGHT_TIMEOUT_SECONDS)}s.",
+                    (
+                        "The simulator process is likely wedged. This is a CoreSimulator state issue, "
+                        "not an Instruments template issue.",
+                        f"Try: `xcrun simctl shutdown {device_id} && xcrun simctl boot {device_id}`",
+                        "If that doesn't help: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
+                    ),
+                )
+            )
+        elif "no such" in lowered or "not installed" in lowered or "no app" in lowered or "unable to find" in lowered:
+            findings.append(
+                PreflightFinding(
+                    "blocker",
+                    f"App '{bundle_id}' is not installed on simulator {device_id}.",
+                    (
+                        f"List installed apps: `xcrun simctl listapps {device_id}`",
+                        f"Install: `xcrun simctl install {device_id} /path/to/App.app`",
+                    ),
+                )
+            )
+        else:
+            findings.append(
+                PreflightFinding("warning", f"`simctl get_app_container` failed: {message}")
+            )
+    return findings
+
+
+def format_preflight_findings(template: str, target_label: str, findings: list[PreflightFinding]) -> str:
+    lines = [f"Refusing to record with template '{template}' against {target_label}: pre-flight failed.", ""]
+    for finding in findings:
+        marker = "-" if finding.severity == "blocker" else "*"
+        lines.append(f"{marker} {finding.message}")
+        for hint in finding.hints:
+            lines.append(f"  - {hint}")
+    return "\n".join(lines)
 
 
 async def export_xml(

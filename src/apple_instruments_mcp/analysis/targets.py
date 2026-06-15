@@ -120,9 +120,41 @@ class RecordingTarget:
         return errors
 
 
-def format_target_error(target: RecordingTarget, template: str, error: str) -> str:
+def format_target_error(
+    target: RecordingTarget,
+    template: str,
+    error: str,
+    *,
+    partial_trace: Path | None = None,
+) -> str:
     msg = error.lower()
     lines = [f"Error profiling with template '{template}' against {target.label}: {error}", ""]
+
+    if "timed out" in msg or "timeout" in msg:
+        lines.append("xctrace did not finish before the wrapper timeout.")
+        if target.bundle_id and target.device_id:
+            lines.extend(
+                [
+                    "- Likely a wedged simulator/CoreSimulator service, not a template or app issue.",
+                    f"- Try: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
+                    "- If that doesn't help: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
+                    f"- Verify the app responds: `xcrun simctl get_app_container {target.device_id} {target.bundle_id} app`",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- Increase `time_limit_seconds` if the workload legitimately takes longer.",
+                    "- Confirm the target process is making forward progress.",
+                ]
+            )
+        if partial_trace is not None:
+            try:
+                size = sum(p.stat().st_size for p in partial_trace.rglob("*") if p.is_file())
+                lines.append(f"- Partial trace bundle preserved at `{partial_trace}` ({size} bytes).")
+            except OSError:
+                lines.append(f"- Partial trace bundle preserved at `{partial_trace}`.")
+        return "\n".join(lines)
 
     bundle_missing = ("not installed" in msg or "could not find application" in msg) and target.bundle_id
     if bundle_missing:

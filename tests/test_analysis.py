@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from apple_instruments_mcp.analysis import (
     RecordingTarget,
@@ -23,6 +24,12 @@ from apple_instruments_mcp.analysis import (
     parse_network,
     parse_time_profiler,
     run_analysis,
+)
+from apple_instruments_mcp.analysis import xctrace as xctrace_module
+from apple_instruments_mcp.analysis.xctrace import (
+    PreflightFinding,
+    format_preflight_findings,
+    preflight_ios_target,
 )
 
 
@@ -763,6 +770,153 @@ class FormatTargetErrorTests(unittest.TestCase):
 
         self.assertIn("Allocations", output)
         self.assertIn("pid:1234", output)
+
+
+    def test_timeout_message_for_simulator_includes_coresim_hints(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        output = format_target_error(
+            target, "App Launch", "Command timed out: xcrun xctrace record ..."
+        )
+
+        self.assertIn("did not finish", output)
+        self.assertIn("wedged simulator", output)
+        self.assertIn("simctl shutdown SIM-123", output)
+        self.assertIn("CoreSimulatorService", output)
+
+    def test_timeout_message_for_non_simulator_target_suggests_time_limit(self) -> None:
+        target = RecordingTarget.build(process_name="MyMacApp")
+
+        output = format_target_error(target, "Time Profiler", "Command timed out: xcrun ...")
+
+        self.assertIn("did not finish", output)
+        self.assertIn("time_limit_seconds", output)
+
+    def test_timeout_message_mentions_partial_trace_path(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_dir = Path(tmp) / "trace.trace"
+            trace_dir.mkdir()
+            (trace_dir / "fake.bin").write_bytes(b"abc")
+
+            output = format_target_error(
+                target,
+                "App Launch",
+                "Command timed out: ...",
+                partial_trace=trace_dir,
+            )
+
+            self.assertIn(str(trace_dir), output)
+            self.assertIn("Partial trace bundle preserved", output)
+
+
+class PreflightIosTargetTests(unittest.TestCase):
+    def _patch_run(self, side_effect):
+        return mock.patch.object(xctrace_module, "run_command", side_effect=side_effect)
+
+    def test_returns_empty_when_device_not_in_simctl_list(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            return json.dumps({"devices": {"runtime": [{"udid": "OTHER", "state": "Booted"}]}})
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(findings, [])
+
+    def test_blocks_when_simulator_not_booted(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Shutdown"}]}})
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "blocker")
+        self.assertIn("not Booted", findings[0].message)
+        self.assertTrue(any("simctl boot SIM-123" in h for h in findings[0].hints))
+
+    def test_passes_when_simulator_booted_and_app_installed(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            calls.append(args)
+            if "list" in args:
+                return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Booted"}]}})
+            return "/Users/.../App.app\n"
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(findings, [])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("get_app_container", calls[1])
+
+    def test_blocks_when_app_not_installed(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            if "list" in args:
+                return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Booted"}]}})
+            raise RuntimeError("No such app com.example.app on device")
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "blocker")
+        self.assertIn("is not installed", findings[0].message)
+        self.assertTrue(any("simctl listapps SIM-123" in h for h in findings[0].hints))
+
+    def test_blocks_when_coresim_wedged_on_get_app_container(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            if "list" in args:
+                return json.dumps({"devices": {"r": [{"udid": "SIM-123", "state": "Booted"}]}})
+            raise RuntimeError("Command timed out: xcrun simctl get_app_container ...")
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "blocker")
+        self.assertIn("CoreSimulator did not respond", findings[0].message)
+        self.assertTrue(any("killall -9 com.apple.CoreSimulator" in h for h in findings[0].hints))
+
+    def test_blocks_when_simctl_list_itself_times_out(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError("Command timed out: xcrun simctl list devices -j")
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("SIM-123", "com.example.app"))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "blocker")
+        self.assertIn("did not respond to `simctl list devices`", findings[0].message)
+
+    def test_udid_lookup_is_case_insensitive(self) -> None:
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            if "list" in args:
+                return json.dumps({"devices": {"r": [{"udid": "AFF97D0A-AAAA", "state": "Shutdown"}]}})
+            return ""
+
+        with self._patch_run(fake):
+            findings = asyncio.run(preflight_ios_target("aff97d0a-aaaa", "com.example.app"))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "blocker")
+
+    def test_format_preflight_findings_includes_hints(self) -> None:
+        findings = [
+            PreflightFinding(
+                "blocker",
+                "Simulator SIM-X is in state 'Shutdown', not Booted.",
+                ("Boot first: `xcrun simctl boot SIM-X`",),
+            )
+        ]
+
+        output = format_preflight_findings("App Launch", "com.example.app", findings)
+
+        self.assertIn("App Launch", output)
+        self.assertIn("com.example.app", output)
+        self.assertIn("Simulator SIM-X", output)
+        self.assertIn("Boot first", output)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ from apple_instruments_mcp.analysis.xctrace import (
     build_record_command,
     export_xml,
     format_command,
+    format_preflight_findings,
+    preflight_ios_target,
     record_trace,
 )
 
@@ -99,11 +101,18 @@ async def run_analysis(
             ]
         )
 
+    if target.device_id and target.bundle_id:
+        preflight_findings = await preflight_ios_target(target.device_id, target.bundle_id)
+        blockers = [finding for finding in preflight_findings if finding.severity == "blocker"]
+        if blockers:
+            return format_preflight_findings(template, target.label, blockers)
+
     if base_dir:
         base_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
     trace_path = tmp_dir / "trace.trace"
     xml_path = tmp_dir / "export.xml"
+    record_failed = False
 
     try:
         await record_trace(template, target, time_limit_seconds, trace_path)
@@ -135,9 +144,11 @@ async def run_analysis(
             )
         return result
     except Exception as error:
-        return format_target_error(target, template, str(error))
+        record_failed = True
+        partial_trace = trace_path if trace_path.exists() else None
+        return format_target_error(target, template, str(error), partial_trace=partial_trace)
     finally:
-        if not keep_trace:
+        if not keep_trace and not record_failed:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
