@@ -483,6 +483,108 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(analysis.status, "good")
         self.assertTrue(any(recommendation.startswith("Total transfer > 1MB") for recommendation in analysis.recommendations))
 
+    def test_parse_network_xctrace_task_intervals(self) -> None:
+        xml = """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//trace-toc[1]/run[1]/data[1]/table[24]">
+  <schema name="com-apple-cfnetwork-task-intervals">
+    <col><mnemonic>start</mnemonic></col>
+    <col><mnemonic>duration</mnemonic></col>
+    <col><mnemonic>process</mnemonic></col>
+    <col><mnemonic>host</mnemonic></col>
+    <col><mnemonic>server-ip</mnemonic></col>
+    <col><mnemonic>session</mnemonic></col>
+    <col><mnemonic>session-is-ephemeral</mnemonic></col>
+    <col><mnemonic>layout-qualifier</mnemonic></col>
+    <col><mnemonic>task-uuid</mnemonic></col>
+    <col><mnemonic>public-task-identifier</mnemonic></col>
+    <col><mnemonic>task-description</mnemonic></col>
+    <col><mnemonic>resume-backtrace</mnemonic></col>
+    <col><mnemonic>http-method</mnemonic></col>
+    <col><mnemonic>url</mnemonic></col>
+    <col><mnemonic>http-path</mnemonic></col>
+    <col><mnemonic>query-string</mnemonic></col>
+    <col><mnemonic>request-attribution</mnemonic></col>
+    <col><mnemonic>successful</mnemonic></col>
+  </schema>
+  <row>
+    <event-time fmt="00:00.000">0</event-time>
+    <duration fmt="750.00 ms">750000000</duration>
+    <process fmt="App">123</process>
+    <domain-name fmt="example.com">example.com</domain-name>
+    <string/>
+    <string/>
+    <boolean>0</boolean>
+    <uint32>1</uint32>
+    <uuid>task</uuid>
+    <uint32>2</uint32>
+    <string/>
+    <text-backtrace/>
+    <word-string fmt="POST">POST</word-string>
+    <string fmt="https://example.com/api">https://example.com/api</string>
+    <string/>
+    <string/>
+    <string/>
+    <boolean>1</boolean>
+  </row>
+</node>
+</trace-query-result>"""
+
+        analysis = parse_network(xml)
+
+        self.assertEqual(analysis.total_requests, 1)
+        self.assertEqual(analysis.slow_requests[0].method, "POST")
+        self.assertEqual(analysis.slow_requests[0].url, "https://example.com/api")
+        self.assertEqual(analysis.slow_requests[0].duration_ms, 750)
+
+    def test_parse_network_connection_rows_when_http_rows_are_absent(self) -> None:
+        xml = """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//trace-toc[1]/run[1]/data[1]/table[29]">
+  <schema name="network-connection-detected">
+    <col><mnemonic>time</mnemonic></col>
+    <col><mnemonic>pid</mnemonic></col>
+    <col><mnemonic>local-address</mnemonic></col>
+    <col><mnemonic>remote-address</mnemonic></col>
+    <col><mnemonic>interface-index</mnemonic></col>
+    <col><mnemonic>recv-buffer-size</mnemonic></col>
+    <col><mnemonic>recv-buffer-used</mnemonic></col>
+    <col><mnemonic>serial-number</mnemonic></col>
+    <col><mnemonic>kind</mnemonic></col>
+  </schema>
+  <row>
+    <event-time id="T" fmt="00:00.000">0</event-time>
+    <sentinel/>
+    <sockaddr fmt="192.168.15.4:64652">1</sockaddr>
+    <sockaddr id="R" fmt="162.159.153.238:443">2</sockaddr>
+    <uint32>21</uint32>
+    <size-in-bytes id="B" fmt="1.93 MiB">2027080</size-in-bytes>
+    <size-in-bytes>0</size-in-bytes>
+    <uint32>149050</uint32>
+    <network-protocol id="P" fmt="tcp4">tcp4</network-protocol>
+  </row>
+  <row>
+    <event-time ref="T"/>
+    <sentinel/>
+    <sockaddr fmt="192.168.15.4:64653">3</sockaddr>
+    <sockaddr ref="R"/>
+    <uint32>21</uint32>
+    <size-in-bytes ref="B"/>
+    <size-in-bytes>0</size-in-bytes>
+    <uint32>149051</uint32>
+    <network-protocol ref="P"/>
+  </row>
+</node>
+</trace-query-result>"""
+
+        analysis = parse_network(xml)
+
+        self.assertEqual(analysis.total_requests, 1)
+        self.assertEqual(analysis.total_transferred_mb, 3.87)
+        self.assertEqual(analysis.slow_requests[0].method, "TCP4")
+        self.assertEqual(analysis.slow_requests[0].url, "162.159.153.238:443")
+        self.assertIn("socket-level", analysis.recommendations[0])
+
     def test_compare_launch_analyses_reports_delta(self) -> None:
         baseline = parse_app_launch(
             _time_profile_single_sample("LaunchSetup", weight_ns=500_000_000),

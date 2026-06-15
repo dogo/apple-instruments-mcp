@@ -10,6 +10,7 @@ from apple_instruments_mcp.analysis import (
     XPATH_ALLOCATIONS_STATISTICS,
     XPATH_APP_LAUNCH,
     XPATH_LEAKS_DETAILS,
+    XPATH_NETWORK_CONNECTIONS,
     XPATH_TIME_PROFILE,
     RecordingTarget,
     analyze_existing,
@@ -219,6 +220,7 @@ async def run_profile(
             dry_run=dry_run,
             keep_trace=keep_trace,
             output_dir=output_dir,
+            xpath=XPATH_NETWORK_CONNECTIONS,
         )
     return f"Unknown profile_type: {profile_type}"
 
@@ -748,6 +750,7 @@ async def analyze_network_trace(
         lambda analysis: format_network(analysis, bundle_id),
         "network",
         has_network_evidence,
+        xpath=XPATH_NETWORK_CONNECTIONS,
     )
 
 

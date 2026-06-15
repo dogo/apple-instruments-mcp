@@ -47,6 +47,7 @@ from apple_instruments_mcp.analysis.models import (
     TimeProfileAnalysis,
 )
 from apple_instruments_mcp.analysis.network import (
+    XPATH_NETWORK_CONNECTIONS,
     format_network,
     has_network_evidence,
     parse_network,
@@ -93,6 +94,7 @@ __all__ = [
     "XPATH_APP_LAUNCH",
     "XPATH_ALLOCATIONS_STATISTICS",
     "XPATH_LEAKS_DETAILS",
+    "XPATH_NETWORK_CONNECTIONS",
     "XPATH_TIME_PROFILE",
     "AllocationAnalysis",
     "AllocationCategory",

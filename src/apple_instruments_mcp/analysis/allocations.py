@@ -14,7 +14,6 @@ from apple_instruments_mcp.analysis.severity import (
     get_memory_severity,
 )
 
-
 XPATH_ALLOCATIONS_STATISTICS = (
     '/trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]'
 )

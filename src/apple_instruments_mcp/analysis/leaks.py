@@ -6,7 +6,6 @@ import xml.etree.ElementTree as ET
 from apple_instruments_mcp.analysis.models import LeakEntry, LeaksAnalysis, Status
 from apple_instruments_mcp.analysis.severity import get_leak_suggestion
 
-
 XPATH_LEAKS_DETAILS = '/trace-toc/run[@number="1"]/tracks/track[@name="Leaks"]/details/detail[@name="Leaks"]'
 
 

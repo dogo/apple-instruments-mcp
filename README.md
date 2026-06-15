@@ -288,7 +288,7 @@ Each parser is wired to a specific `xctrace export --xpath` query. The tooling h
 | App Launch | `time-profile` (CPU samples, idle leaves filtered) | ✅ validated against real traces |
 | Allocations | `tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]` | ✅ validated against real traces |
 | Leaks | `tracks/track[@name="Leaks"]/details/detail[@name="Leaks"]` | ✅ validated against real traces |
-| Network | (legacy regex) | ⚠️ not validated — pending a Network trace from a physical device (`xctrace export --har` is also worth considering) |
+| Network | `network-connection-detected` (socket-level fallback) | ✅ validated against a real physical-device trace; HTTP/HAR rows may be absent if Instruments does not export URLSession task details |
 
 ### App Launch caveats
 
