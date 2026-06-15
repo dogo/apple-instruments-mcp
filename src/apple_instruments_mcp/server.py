@@ -7,27 +7,35 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from apple_instruments_mcp.analysis import (
+    XPATH_ALLOCATIONS_STATISTICS,
     XPATH_APP_LAUNCH,
+    XPATH_LEAKS_DETAILS,
     XPATH_TIME_PROFILE,
     RecordingTarget,
     analyze_existing,
     build_record_command,
+    compare_allocation_analyses,
     compare_existing,
     compare_launch_analyses,
     compare_time_profile_analyses,
+    format_allocations,
     format_command,
     format_launch,
+    format_leaks,
     format_network,
     format_time_profiler,
+    has_allocations_evidence,
     has_launch_evidence,
+    has_leaks_evidence,
     has_network_evidence,
     has_time_profiler_evidence,
     list_as_json,
+    parse_allocations,
     parse_app_launch,
+    parse_leaks,
     parse_network,
     parse_time_profiler,
     run_analysis,
-    unsupported_template_report,
 )
 from apple_instruments_mcp.analysis import (
     list_devices as xctrace_list_devices,
@@ -158,9 +166,33 @@ async def run_profile(
             xpath=XPATH_APP_LAUNCH,
         )
     if profile_type == "allocations":
-        return unsupported_template_report("allocations", target.label)
+        return await run_analysis(
+            "Allocations",
+            target,
+            time_limit_seconds,
+            parse_allocations,
+            lambda analysis: format_allocations(analysis, target.label),
+            "allocations",
+            has_allocations_evidence,
+            dry_run=dry_run,
+            keep_trace=keep_trace,
+            output_dir=output_dir,
+            xpath=XPATH_ALLOCATIONS_STATISTICS,
+        )
     if profile_type == "leaks":
-        return unsupported_template_report("leaks", target.label)
+        return await run_analysis(
+            "Leaks",
+            target,
+            time_limit_seconds,
+            parse_leaks,
+            lambda analysis: format_leaks(analysis, target.label),
+            "leaks",
+            has_leaks_evidence,
+            dry_run=dry_run,
+            keep_trace=keep_trace,
+            output_dir=output_dir,
+            xpath=XPATH_LEAKS_DETAILS,
+        )
     if profile_type == "time_profiler":
         return await run_analysis(
             "Time Profiler",
@@ -456,8 +488,11 @@ async def analyze_allocations(
     dry_run: DryRun = False,
     keep_trace: KeepTrace = False,
     output_dir: OutputDir = None,
+    memory_warning_mb: MemoryWarningMb = 100,
+    memory_critical_mb: MemoryCriticalMb = 200,
+    memory_cache_warning_mb: MemoryCacheWarningMb = 150,
 ) -> str:
-    """Not supported: xctrace export does not expose Allocations data. Use Instruments.app."""
+    """Record an Allocations trace and report live memory and top allocation categories."""
     target = make_target(
         bundle_id=bundle_id,
         device_id=device_id,
@@ -467,16 +502,48 @@ async def analyze_allocations(
         pid=pid,
         all_processes=all_processes,
     )
-    return unsupported_template_report("allocations", target.label)
+    return await run_analysis(
+        "Allocations",
+        target,
+        time_limit_seconds,
+        lambda xml: parse_allocations(
+            xml,
+            memory_warning_mb=memory_warning_mb,
+            memory_critical_mb=memory_critical_mb,
+            memory_cache_warning_mb=memory_cache_warning_mb,
+        ),
+        lambda analysis: format_allocations(analysis, target.label),
+        "allocations",
+        has_allocations_evidence,
+        dry_run=dry_run,
+        keep_trace=keep_trace,
+        output_dir=output_dir,
+        xpath=XPATH_ALLOCATIONS_STATISTICS,
+    )
 
 
 @mcp.tool()
 async def analyze_allocations_trace(
     trace_path: TracePath,
     bundle_id: Annotated[str, Field(description="Target name used in the report.")] = "unknown target",
+    memory_warning_mb: MemoryWarningMb = 100,
+    memory_critical_mb: MemoryCriticalMb = 200,
+    memory_cache_warning_mb: MemoryCacheWarningMb = 150,
 ) -> str:
-    """Not supported: xctrace export does not expose Allocations data. Use Instruments.app."""
-    return unsupported_template_report("allocations", bundle_id)
+    """Analyze an existing Allocations .trace bundle."""
+    return await analyze_existing(
+        trace_path,
+        lambda xml: parse_allocations(
+            xml,
+            memory_warning_mb=memory_warning_mb,
+            memory_critical_mb=memory_critical_mb,
+            memory_cache_warning_mb=memory_cache_warning_mb,
+        ),
+        lambda analysis: format_allocations(analysis, bundle_id),
+        "allocations",
+        has_allocations_evidence,
+        xpath=XPATH_ALLOCATIONS_STATISTICS,
+    )
 
 
 @mcp.tool()
@@ -492,8 +559,9 @@ async def analyze_leaks(
     dry_run: DryRun = False,
     keep_trace: KeepTrace = False,
     output_dir: OutputDir = None,
+    leak_critical_count: LeakCriticalCount = 10,
 ) -> str:
-    """Not supported: xctrace export does not expose Leaks data. Use Instruments.app."""
+    """Record a Leaks trace and report leaks with retain cycle hints when xctrace exports leak details."""
     target = make_target(
         bundle_id=bundle_id,
         device_id=device_id,
@@ -503,16 +571,36 @@ async def analyze_leaks(
         pid=pid,
         all_processes=all_processes,
     )
-    return unsupported_template_report("leaks", target.label)
+    return await run_analysis(
+        "Leaks",
+        target,
+        time_limit_seconds,
+        lambda xml: parse_leaks(xml, leak_critical_count=leak_critical_count),
+        lambda analysis: format_leaks(analysis, target.label),
+        "leaks",
+        has_leaks_evidence,
+        dry_run=dry_run,
+        keep_trace=keep_trace,
+        output_dir=output_dir,
+        xpath=XPATH_LEAKS_DETAILS,
+    )
 
 
 @mcp.tool()
 async def analyze_leaks_trace(
     trace_path: TracePath,
     bundle_id: Annotated[str, Field(description="Target name used in the report.")] = "unknown target",
+    leak_critical_count: LeakCriticalCount = 10,
 ) -> str:
-    """Not supported: xctrace export does not expose Leaks data. Use Instruments.app."""
-    return unsupported_template_report("leaks", bundle_id)
+    """Analyze an existing Leaks .trace bundle."""
+    return await analyze_existing(
+        trace_path,
+        lambda xml: parse_leaks(xml, leak_critical_count=leak_critical_count),
+        lambda analysis: format_leaks(analysis, bundle_id),
+        "leaks",
+        has_leaks_evidence,
+        xpath=XPATH_LEAKS_DETAILS,
+    )
 
 
 @mcp.tool()
@@ -697,9 +785,25 @@ async def compare_memory_traces(
     baseline_trace_path: BaselineTracePath,
     candidate_trace_path: CandidateTracePath,
     bundle_id: Annotated[str, Field(description="Target name used in the report.")] = "unknown target",
+    memory_warning_mb: MemoryWarningMb = 100,
+    memory_critical_mb: MemoryCriticalMb = 200,
+    memory_cache_warning_mb: MemoryCacheWarningMb = 150,
 ) -> str:
-    """Not supported: xctrace export does not expose Allocations data. Use Instruments.app."""
-    return unsupported_template_report("allocations", bundle_id)
+    """Compare two Allocations .trace bundles and report memory deltas."""
+    return await compare_existing(
+        baseline_trace_path,
+        candidate_trace_path,
+        lambda xml: parse_allocations(
+            xml,
+            memory_warning_mb=memory_warning_mb,
+            memory_critical_mb=memory_critical_mb,
+            memory_cache_warning_mb=memory_cache_warning_mb,
+        ),
+        lambda baseline, candidate: compare_allocation_analyses(baseline, candidate, bundle_id),
+        "allocations",
+        has_allocations_evidence,
+        xpath=XPATH_ALLOCATIONS_STATISTICS,
+    )
 
 
 @mcp.tool()

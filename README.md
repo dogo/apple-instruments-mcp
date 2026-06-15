@@ -114,16 +114,16 @@ Compare ~/Desktop/baseline.trace and ~/Desktop/candidate.trace for launch regres
 | `profile_all_processes` | Selected by `profile_type` | Profiles all processes on the host or selected device. |
 | `analyze_launch` | App Launch | Records and analyzes app startup time. |
 | `analyze_launch_trace` | App Launch | Analyzes an existing App Launch `.trace`. |
-| `analyze_allocations` | Allocations | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
-| `analyze_allocations_trace` | Allocations | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
-| `analyze_leaks` | Leaks | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
-| `analyze_leaks_trace` | Leaks | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
+| `analyze_allocations` | Allocations | Records memory allocations and reports live heap/VM totals plus top allocation categories. |
+| `analyze_allocations_trace` | Allocations | Analyzes an existing Allocations `.trace`. |
+| `analyze_leaks` | Leaks | Records a Leaks trace and reports exported leak details when available. |
+| `analyze_leaks_trace` | Leaks | Analyzes an existing Leaks `.trace` when leak details are exportable. |
 | `analyze_time_profiler` | Time Profiler | Records CPU samples and reports hot methods. |
 | `analyze_time_profiler_trace` | Time Profiler | Analyzes an existing Time Profiler `.trace`. |
 | `analyze_network` | Network | Records network requests, latency, transfer sizes, and status codes. |
 | `analyze_network_trace` | Network | Analyzes an existing Network `.trace`. |
 | `compare_launch_traces` | App Launch | Compares two App Launch traces and reports startup deltas. |
-| `compare_memory_traces` | Allocations | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
+| `compare_memory_traces` | Allocations | Compares two Allocations traces and reports memory deltas. |
 | `compare_cpu_traces` | Time Profiler | Compares two Time Profiler traces and reports CPU deltas. |
 | `build_xctrace_command` | Any | Returns the exact `xcrun xctrace record` command for a target without executing it. |
 
@@ -280,14 +280,14 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 
 ## Parser Status
 
-Each parser is wired to a specific `xctrace export --xpath` schema. The tooling has been validated end-to-end against real `.trace` bundles for the ✅ rows. The Allocations and Leaks tools intentionally short-circuit with an explanatory error message because Apple's `xctrace export` does not expose either of those data sets via xpath.
+Each parser is wired to a specific `xctrace export --xpath` query. The tooling has been validated end-to-end against real `.trace` bundles for the ✅ rows.
 
 | Template | xpath / schema | Status |
 | --- | --- | --- |
 | Time Profiler | `time-profile` | ✅ validated against real traces |
 | App Launch | `time-profile` (CPU samples, idle leaves filtered) | ✅ validated against real traces |
-| Allocations | n/a | ❌ not exposed by `xctrace export` — tool returns a clear "use Instruments.app" message |
-| Leaks | n/a | ❌ not exposed by `xctrace export` — tool returns a clear "use Instruments.app" message |
+| Allocations | `tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]` | ✅ validated against real traces |
+| Leaks | `tracks/track[@name="Leaks"]/details/detail` | ⚠️ best effort — pending a valid Leaks trace fixture |
 | Network | (legacy regex) | ⚠️ not validated — pending a Network trace from a physical device (`xctrace export --har` is also worth considering) |
 
 ### App Launch caveats

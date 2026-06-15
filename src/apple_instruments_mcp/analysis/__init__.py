@@ -9,6 +9,7 @@ importing from `apple_instruments_mcp.analysis` directly.
 from __future__ import annotations
 
 from apple_instruments_mcp.analysis.allocations import (
+    XPATH_ALLOCATIONS_STATISTICS,
     compare_allocation_analyses,
     format_allocations,
     has_allocations_evidence,
@@ -22,6 +23,7 @@ from apple_instruments_mcp.analysis.launch import (
     parse_app_launch,
 )
 from apple_instruments_mcp.analysis.leaks import (
+    XPATH_LEAKS_DETAILS,
     format_leaks,
     has_leaks_evidence,
     parse_leaks,
@@ -89,6 +91,8 @@ from apple_instruments_mcp.analysis.xml_helpers import parse_time_profile_xml
 
 __all__ = [
     "XPATH_APP_LAUNCH",
+    "XPATH_ALLOCATIONS_STATISTICS",
+    "XPATH_LEAKS_DETAILS",
     "XPATH_TIME_PROFILE",
     "AllocationAnalysis",
     "AllocationCategory",

@@ -14,6 +14,7 @@ from apple_instruments_mcp.analysis import (
     compare_time_profile_analyses,
     format_quality,
     format_target_error,
+    has_allocations_evidence,
     has_time_profiler_evidence,
     list_as_json,
     parse_allocations,
@@ -306,6 +307,33 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual(analysis.status, "critical")
 
+    def test_parse_allocations_statistics_detail_from_real_xctrace_shape(self) -> None:
+        xml = """<?xml version="1.0"?>
+        <trace-query-result>
+          <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[1]'>
+            <row category="All Heap &amp; Anonymous VM" persistent-bytes="43207888"
+                 count-persistent="189754" total-bytes="981356224" count-total="8867577"/>
+            <row category="All Heap Allocations" persistent-bytes="32476368"
+                 count-persistent="189648" total-bytes="917933760" count-total="8866677"/>
+            <row category="All VM Regions" persistent-bytes="73875456"
+                 count-persistent="134" total-bytes="160661504" count-total="1015"/>
+            <row category="SWDestinyTrades.CardDTO" persistent-bytes="829440"
+                 count-persistent="1853" total-bytes="2641920" count-total="2000"/>
+            <row category="VM: ImageIO_AppleJPEG_Data" persistent-bytes="4194304"
+                 count-persistent="8" total-bytes="13631488" count-total="12"/>
+          </node>
+        </trace-query-result>"""
+
+        analysis = parse_allocations(xml)
+
+        self.assertTrue(has_allocations_evidence(xml))
+        self.assertEqual(analysis.live_memory_mb, 31.0)
+        self.assertEqual(analysis.peak_memory_mb, 70.5)
+        categories = {category.type: category for category in analysis.top_allocations}
+        self.assertEqual(categories["SWDestinyTrades.CardDTO"].live_count, 1853)
+        self.assertEqual(categories["VM: ImageIO_AppleJPEG_Data"].live_bytes, 4194304)
+        self.assertTrue(any("ImageIO" in recommendation for recommendation in analysis.recommendations))
+
     def test_parse_leaks_direct_entries(self) -> None:
         xml = '<leak type="Closure" count="2" size="4096" root-cycle="true" />'
 
@@ -313,6 +341,21 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual(analysis.total_leaks, 2)
         self.assertEqual(analysis.total_leaked_bytes, 4096)
+        self.assertTrue(analysis.leaks[0].root_cycle)
+
+    def test_parse_leaks_accepts_detail_row_attributes(self) -> None:
+        xml = """<?xml version="1.0"?>
+        <trace-query-result>
+          <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[1]'>
+            <row category="Closure" count="2" size="4096" root-cycle="true"/>
+            <row responsible-library="UIKit" count-persistent="1" persistent-bytes="2048"/>
+          </node>
+        </trace-query-result>"""
+
+        analysis = parse_leaks(xml)
+
+        self.assertEqual(analysis.total_leaks, 3)
+        self.assertEqual(analysis.total_leaked_bytes, 6144)
         self.assertTrue(analysis.leaks[0].root_cycle)
 
     def test_parse_time_profiler_from_real_xctrace_xml(self) -> None:

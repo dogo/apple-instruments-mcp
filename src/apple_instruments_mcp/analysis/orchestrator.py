@@ -27,18 +27,17 @@ _UNSUPPORTED_TEMPLATES: dict[str, str] = {
 
 
 def unsupported_template_report(template_kind: str, target_label: str) -> str:
-    """Stable error report for templates xctrace export cannot read."""
+    """Stable error report for template views without a supported parser."""
     pretty = _UNSUPPORTED_TEMPLATES.get(template_kind, template_kind.title())
     return "\n".join(
         [
             f"# {pretty} Analysis - {target_label}",
             "",
-            f"## {pretty} is not available via `xctrace export`",
+            f"## {pretty} is not available in this parser",
             "",
-            f"`xcrun xctrace export` does not expose the {pretty} schema through `--xpath`. The",
-            "data is stored in binary form inside the .trace bundle and can only be read by",
-            "the Instruments GUI today. Open the trace in Instruments.app to view full",
-            f"{pretty.lower()} information.",
+            f"This version does not have a validated parser for the exported {pretty} view.",
+            "Open the trace in Instruments.app for full detail, or inspect the trace table",
+            "of contents with `xcrun xctrace export --toc` to find an exportable detail.",
             "",
             "## Workarounds",
             "",

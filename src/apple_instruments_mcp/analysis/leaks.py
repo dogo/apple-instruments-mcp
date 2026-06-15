@@ -1,21 +1,66 @@
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 
 from apple_instruments_mcp.analysis.models import LeakEntry, LeaksAnalysis, Status
 from apple_instruments_mcp.analysis.severity import get_leak_suggestion
 
 
+XPATH_LEAKS_DETAILS = '//trace-toc/run[@number="1"]/tracks/track[@name="Leaks"]/details/detail'
+
+
 def has_leaks_evidence(xml_content: str) -> bool:
-    return "<leak" in xml_content or bool(re.search(r"<(responsible-library|size)[^>]*>", xml_content))
+    return (
+        "<leak" in xml_content
+        or bool(re.search(r"<(responsible-library|size)[^>]*>", xml_content))
+        or bool(re.search(r'<row[^>]+(?:leak|size|bytes|category|responsible)', xml_content, re.IGNORECASE))
+    )
 
 
 def parse_leaks(xml_content: str, *, leak_critical_count: int = 10) -> LeaksAnalysis:
-    # TODO: Not yet validated against a real Leaks .trace export. The regex below
-    # matches a fabricated <leak type=...> shape; xctrace's Leaks template emits its
-    # own schema with separate symbol/responsible-frame rows. Rewrite once a real
-    # Leaks trace is available.
     leaks: list[LeakEntry] = []
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        root = None
+
+    if root is not None:
+        for row in root.iter("row"):
+            type_name = (
+                row.attrib.get("type")
+                or row.attrib.get("category")
+                or row.attrib.get("responsible-library")
+                or row.attrib.get("responsible-caller")
+            )
+            size_value = (
+                row.attrib.get("size")
+                or row.attrib.get("bytes")
+                or row.attrib.get("persistent-bytes")
+                or row.attrib.get("total-bytes")
+            )
+            if not type_name or not size_value:
+                continue
+            count = int(
+                row.attrib.get("count")
+                or row.attrib.get("count-persistent")
+                or row.attrib.get("count-total")
+                or 1
+            )
+            size = int(size_value)
+            root_cycle = (row.attrib.get("root-cycle") or row.attrib.get("cycle") or "false").lower() == "true"
+            if count <= 0 or size <= 0:
+                continue
+            leaks.append(
+                LeakEntry(
+                    type=type_name,
+                    count=count,
+                    total_bytes=size,
+                    root_cycle=root_cycle,
+                    suggestion=get_leak_suggestion(type_name),
+                )
+            )
+
     leak_pattern = re.compile(
         r'<leak[^>]*type="([^"]+)"[^>]*count="(\d+)"[^>]*size="(\d+)"[^>]*root-cycle="(true|false)"'
     )
@@ -44,7 +89,13 @@ def parse_leaks(xml_content: str, *, leak_critical_count: int = 10) -> LeaksAnal
             if not type_name or size == 0:
                 continue
             leaks.append(
-                LeakEntry(type=type_name, count=1, total_bytes=size, root_cycle=False, suggestion=get_leak_suggestion(type_name))
+                LeakEntry(
+                    type=type_name,
+                    count=1,
+                    total_bytes=size,
+                    root_cycle=False,
+                    suggestion=get_leak_suggestion(type_name),
+                )
             )
 
     leaks.sort(key=lambda leak: leak.total_bytes, reverse=True)
