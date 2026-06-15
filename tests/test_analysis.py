@@ -12,7 +12,6 @@ from apple_instruments_mcp.analysis import (
     compare_allocation_analyses,
     compare_launch_analyses,
     compare_time_profile_analyses,
-    format_launch,
     format_quality,
     format_target_error,
     has_time_profiler_evidence,
@@ -24,6 +23,119 @@ from apple_instruments_mcp.analysis import (
     parse_time_profiler,
     run_analysis,
 )
+
+
+def _time_profile_fixture() -> str:
+    # Three 100ms samples mirroring xctrace's real --xpath time-profile output:
+    #   row 1: LeafFunc -> MidFunc -> RootFunc          (leaf = LeafFunc)
+    #   row 2: same backtrace by reference              (leaf = LeafFunc)
+    #   row 3: OtherLeaf -> RootFunc                    (leaf = OtherLeaf)
+    return """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <weight id="W" fmt="150.00 ms">150000000</weight>
+    <tagged-backtrace id="TB1">
+      <backtrace id="B1">
+        <frame id="LEAF" name="LeafFunc" addr="0x100"/>
+        <frame id="MID" name="MidFunc" addr="0x200"/>
+        <frame id="ROOT" name="RootFunc" addr="0x300"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <weight ref="W"/>
+    <tagged-backtrace id="TB2">
+      <backtrace id="B2">
+        <frame ref="LEAF"/>
+        <frame ref="MID"/>
+        <frame ref="ROOT"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <weight ref="W"/>
+    <tagged-backtrace id="TB3">
+      <backtrace id="B3">
+        <frame id="OTHER" name="OtherLeaf" addr="0x400"/>
+        <frame ref="ROOT"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+</node>
+</trace-query-result>"""
+
+
+def _launch_fixture() -> str:
+    # Four 200ms time-profile samples covering the cases parse_app_launch handles:
+    #   - Swift runtime symbol (pre-main classification)
+    #   - mach_o:: dyld symbol (pre-main classification, included)
+    #   - AppDelegate Cocoa method (post-main classification)
+    #   - mach_msg2_trap leaf (idle wait, must be dropped entirely)
+    return """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <weight id="W" fmt="200.00 ms">200000000</weight>
+    <thread-state id="RUN" fmt="Running">Running</thread-state>
+    <tagged-backtrace id="TB1">
+      <backtrace id="B1">
+        <frame name="swift_conformsToProtocol" addr="0x100"/>
+        <frame name="start" addr="0x300"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <tagged-backtrace id="TB2">
+      <backtrace id="B2">
+        <frame name="mach_o::UnsafeHeader::forEachLoadCommand" addr="0x200"/>
+        <frame name="start" addr="0x300"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <tagged-backtrace id="TB3">
+      <backtrace id="B3">
+        <frame name="-[AppDelegate didFinishLaunchingWithOptions:]" addr="0x400"/>
+        <frame name="UIApplicationMain" addr="0x500"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <tagged-backtrace id="TB4">
+      <backtrace id="B4">
+        <frame name="mach_msg2_trap" addr="0x600"/>
+        <frame name="start_wqthread" addr="0x700"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+</node>
+</trace-query-result>"""
+
+
+def _time_profile_single_sample(symbol: str, weight_ns: int) -> str:
+    return f"""<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <weight fmt="{weight_ns / 1_000_000:.2f} ms">{weight_ns}</weight>
+    <tagged-backtrace>
+      <backtrace>
+        <frame name="{symbol}" addr="0x1"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+</node>
+</trace-query-result>"""
 
 
 class AnalysisTests(unittest.TestCase):
@@ -134,42 +246,43 @@ class AnalysisTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RecordingTarget.build(bundle_id="com.example.app", launch_path="/Applications/MyApp.app")
 
-    def test_parse_app_launch_from_node_call_tree(self) -> None:
-        xml = """
-        <trace>
-          <launch-time>1.2</launch-time>
-          <node name="-[DatabaseManager setup]" self-weight="540ms" total-weight="540ms" />
-          <node name="+[AnalyticsSDK configure:]" self-weight="210ms" total-weight="210ms" />
-        </trace>
-        """
+    def test_parse_app_launch_classifies_phases_from_real_xml(self) -> None:
+        xml = _launch_fixture()
 
         analysis = parse_app_launch(xml, "com.example.app")
-        output = format_launch(analysis, "com.example.app")
 
-        self.assertEqual(analysis.total_launch_ms, 1200)
-        self.assertEqual(analysis.status, "critical")
-        self.assertEqual(analysis.offenders[0].symbol, "-[DatabaseManager setup]")
-        self.assertIn("Move database initialization", output)
+        # 4 samples of 200ms each, but the mach_msg2_trap one is dropped as idle.
+        self.assertEqual(analysis.total_launch_ms, 600)
+        # 600ms total -> between launch_good_ms (400) and launch_critical_ms (1000).
+        self.assertEqual(analysis.status, "warning")
+
+        offenders = {offender.symbol: offender for offender in analysis.offenders}
+        # Swift runtime symbol -> pre-main phase.
+        self.assertEqual(offenders["swift_conformsToProtocol"].phase, "pre-main")
+        # Cocoa method on the app -> post-main phase.
+        self.assertEqual(offenders["-[AppDelegate didFinishLaunchingWithOptions:]"].phase, "post-main")
+        # mach_msg2_trap leaf samples should be dropped entirely as idle wait.
+        self.assertNotIn("mach_msg2_trap", offenders)
+
+        phase_names = {phase.name for phase in analysis.phases}
+        self.assertIn("pre-main (dyld + static init)", phase_names)
+        self.assertIn("post-main (AppDelegate + UI)", phase_names)
 
     def test_parse_app_launch_accepts_custom_thresholds(self) -> None:
-        xml = """
-        <trace>
-          <launch-time>0.8</launch-time>
-          <node name="-[Warmup run]" self-weight="120ms" total-weight="120ms" />
-        </trace>
-        """
+        xml = _launch_fixture()
 
         analysis = parse_app_launch(
             xml,
             "com.example.app",
-            launch_good_ms=900,
-            launch_critical_ms=1500,
+            launch_good_ms=1000,
+            launch_critical_ms=2000,
             offender_warning_ms=900,
             offender_critical_ms=1000,
         )
 
         self.assertEqual(analysis.status, "good")
-        self.assertEqual(analysis.offenders[0].severity, "ok")
+        # 200ms self per offender is below the 900ms warning threshold -> ok.
+        self.assertTrue(all(offender.severity == "ok" for offender in analysis.offenders))
 
     def test_parse_allocations_rows(self) -> None:
         xml = """
@@ -202,28 +315,102 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(analysis.total_leaked_bytes, 4096)
         self.assertTrue(analysis.leaks[0].root_cycle)
 
-    def test_parse_time_profiler_from_node_call_tree(self) -> None:
-        xml = '<node name="JSONDecoder.decode" self-weight="75ms" total-weight="120ms" />'
+    def test_parse_time_profiler_from_real_xctrace_xml(self) -> None:
+        xml = _time_profile_fixture()
 
         analysis = parse_time_profiler(xml)
 
-        self.assertEqual(analysis.total_duration_ms, 120)
-        self.assertEqual(analysis.hot_methods[0].severity, "warning")
-        self.assertIn("JSON", analysis.hot_methods[0].symbol)
+        # 3 samples of 150ms each.
+        self.assertEqual(analysis.total_duration_ms, 450)
+        self.assertEqual(analysis.status, "critical")
+
+        symbols = {method.symbol: method for method in analysis.hot_methods}
+        # LeafFunc is the leaf in 2 samples -> 300ms self.
+        self.assertIn("LeafFunc", symbols)
+        self.assertEqual(symbols["LeafFunc"].self_time_ms, 300)
+        self.assertEqual(symbols["LeafFunc"].total_time_ms, 300)
+        self.assertEqual(symbols["LeafFunc"].severity, "critical")
+        # OtherLeaf is the leaf in 1 sample -> 150ms self.
+        self.assertIn("OtherLeaf", symbols)
+        self.assertEqual(symbols["OtherLeaf"].self_time_ms, 150)
+        self.assertEqual(symbols["OtherLeaf"].severity, "warning")
+        # MidFunc / RootFunc only appear as non-leaf frames -> zero self time, filtered.
+        self.assertNotIn("MidFunc", symbols)
+        self.assertNotIn("RootFunc", symbols)
 
     def test_parse_time_profiler_accepts_custom_thresholds(self) -> None:
-        xml = '<node name="Work.run" self-weight="75ms" total-weight="120ms" />'
+        xml = _time_profile_fixture()
 
         analysis = parse_time_profiler(
             xml,
-            total_good_ms=150,
-            total_critical_ms=300,
-            method_warning_ms=100,
-            method_critical_ms=200,
+            total_good_ms=500,
+            total_critical_ms=1000,
+            method_warning_ms=400,
+            method_critical_ms=800,
         )
 
         self.assertEqual(analysis.status, "good")
-        self.assertEqual(analysis.hot_methods[0].severity, "ok")
+        symbols = {method.symbol: method for method in analysis.hot_methods}
+        # LeafFunc: 300ms self is below the new 400ms warning threshold -> ok.
+        self.assertEqual(symbols["LeafFunc"].severity, "ok")
+
+    def test_parse_time_profiler_resolves_xml_refs(self) -> None:
+        # Same leaf frame reused by reference across two samples - both samples
+        # should attribute self-time to the dereferenced symbol.
+        xml = """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <weight id="W" fmt="50.00 ms">50000000</weight>
+    <tagged-backtrace id="TB1">
+      <backtrace id="B1">
+        <frame id="SharedLeaf" name="SharedLeaf" addr="0x1"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <weight ref="W"/>
+    <tagged-backtrace id="TB2">
+      <backtrace id="B2">
+        <frame ref="SharedLeaf"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+</node>
+</trace-query-result>"""
+
+        analysis = parse_time_profiler(xml)
+
+        self.assertEqual(analysis.total_duration_ms, 100)
+        symbols = {method.symbol for method in analysis.hot_methods}
+        self.assertIn("SharedLeaf", symbols)
+
+    def test_parse_time_profiler_skips_deduplicated_symbol(self) -> None:
+        xml = """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <weight fmt="100.00 ms">100000000</weight>
+    <tagged-backtrace>
+      <backtrace>
+        <frame name="&lt;deduplicated_symbol&gt;" addr="0x1"/>
+        <frame name="RealLeaf" addr="0x2"/>
+        <frame name="RealRoot" addr="0x3"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+</node>
+</trace-query-result>"""
+
+        analysis = parse_time_profiler(xml)
+
+        symbols = {method.symbol for method in analysis.hot_methods}
+        # The deduplicated_symbol leaf is skipped; RealLeaf becomes the leaf and gets self.
+        self.assertIn("RealLeaf", symbols)
+        leaf_method = next(method for method in analysis.hot_methods if method.symbol == "RealLeaf")
+        self.assertEqual(leaf_method.self_time_ms, 100)
 
     def test_parse_network_requests(self) -> None:
         xml = '<request url="https://example.com/api" method="GET" duration="0.8" bytes="2048" status="200" />'
@@ -250,11 +437,11 @@ class AnalysisTests(unittest.TestCase):
 
     def test_compare_launch_analyses_reports_delta(self) -> None:
         baseline = parse_app_launch(
-            '<trace><launch-time>0.5</launch-time><node name="A.start" self-weight="100ms" total-weight="100ms" /></trace>',
+            _time_profile_single_sample("LaunchSetup", weight_ns=500_000_000),
             "com.example.app",
         )
         candidate = parse_app_launch(
-            '<trace><launch-time>0.8</launch-time><node name="A.start" self-weight="200ms" total-weight="200ms" /></trace>',
+            _time_profile_single_sample("LaunchSetup", weight_ns=800_000_000),
             "com.example.app",
         )
 
@@ -278,13 +465,13 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("+2MB (regression)", output)
 
     def test_compare_time_profile_analyses_reports_improvement(self) -> None:
-        baseline = parse_time_profiler('<node name="Work.run" self-weight="120ms" total-weight="150ms" />')
-        candidate = parse_time_profiler('<node name="Work.run" self-weight="80ms" total-weight="100ms" />')
+        baseline = parse_time_profiler(_time_profile_single_sample("Work.run", weight_ns=120_000_000))
+        candidate = parse_time_profiler(_time_profile_single_sample("Work.run", weight_ns=80_000_000))
 
         output = compare_time_profile_analyses(baseline, candidate, "com.example.app")
 
         self.assertIn("CPU Trace Comparison", output)
-        self.assertIn("-50ms (improvement)", output)
+        self.assertIn("-40ms (improvement)", output)
 
 
 class RecordingTargetValidationTests(unittest.TestCase):

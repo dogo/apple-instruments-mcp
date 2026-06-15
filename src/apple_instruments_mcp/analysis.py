@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import re
 import shlex
 import shutil
 import tempfile
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeVar
+
+XPATH_TIME_PROFILE = '/trace-toc/run/data/table[@schema="time-profile"]'
+XPATH_APP_LAUNCH = '/trace-toc/run/data/table[@schema="time-profile"]'
 
 Severity = Literal["critical", "warning", "ok"]
 Status = Literal["good", "warning", "critical"]
@@ -499,14 +503,10 @@ def format_quality(quality: AnalysisQuality) -> str:
 
 
 def has_launch_evidence(xml_content: str) -> bool:
-    frames, total_ms = parse_call_tree(xml_content)
-    return bool(frames) or total_ms > 0 or bool(
-        _first_match(
-            [r"launch-time[^>]*>([0-9.]+)", r"total[^>]*time[^>]*>([0-9.]+)"],
-            xml_content,
-            re.IGNORECASE,
-        )
-    )
+    if 'schema name="time-profile"' in xml_content or "<tagged-backtrace" in xml_content:
+        return True
+    frames, total_ms = parse_time_profile_xml(xml_content)
+    return bool(frames) or total_ms > 0
 
 
 def has_allocations_evidence(xml_content: str) -> bool:
@@ -518,7 +518,9 @@ def has_leaks_evidence(xml_content: str) -> bool:
 
 
 def has_time_profiler_evidence(xml_content: str) -> bool:
-    frames, total_ms = parse_call_tree(xml_content)
+    if 'schema name="time-profile"' in xml_content or "<tagged-backtrace" in xml_content:
+        return True
+    frames, total_ms = parse_time_profile_xml(xml_content)
     return bool(frames) or total_ms > 0
 
 
@@ -562,7 +564,15 @@ async def record_trace(
     await run_command(*args, timeout=timeout)
 
 
-async def export_xml(trace_path: Path, output_xml_path: Path, xpath: str | None = None) -> None:
+async def export_xml(
+    trace_path: Path,
+    output_xml_path: Path,
+    *,
+    xpath: str | None = None,
+    toc: bool = False,
+) -> None:
+    if not xpath and not toc:
+        raise ValueError("export_xml requires either xpath or toc=True")
     args = [
         "xcrun",
         "xctrace",
@@ -574,46 +584,181 @@ async def export_xml(trace_path: Path, output_xml_path: Path, xpath: str | None 
     ]
     if xpath:
         args.extend(["--xpath", xpath])
+    else:
+        args.append("--toc")
     await run_command(*args)
 
 
-def parse_call_tree(xml_content: str) -> tuple[list[CallTreeFrame], float]:
-    frames: list[CallTreeFrame] = []
-    total_ms = 0.0
-    total_weight = 0
-    raw: list[tuple[str, int, int]] = []
+_NS_PER_MS = 1_000_000
 
-    frame_pattern = re.compile(r'<frame[^>]*\sweight="(\d+)"[^>]*\sself="(\d+)"[^>]*>([^<]+)</frame>')
-    for match in frame_pattern.finditer(xml_content):
-        weight = int(match.group(1))
-        self_weight = int(match.group(2))
-        total_weight += self_weight
-        raw.append((match.group(3).strip(), weight, self_weight))
+# Leaf symbols where the thread is parked in a kernel wait. Instruments hides these
+# in the Time Profiler view by default ("Hide System Libraries"). Counting them as
+# CPU work would massively inflate totals on traces that keep recording after the
+# app is idle (workers parked in mach_msg2_trap / semaphore_wait dominate the sample
+# stream). When a row's leaf is one of these, we drop the whole sample.
+_IDLE_LEAF_SYMBOLS = frozenset(
+    {
+        "mach_msg2_trap",
+        "mach_msg_trap",
+        "mach_msg_overwrite_trap",
+        "start_wqthread",
+        "_pthread_wqthread",
+        "semaphore_wait_trap",
+        "semaphore_timedwait_trap",
+        "__ulock_wait",
+        "__psynch_cvwait",
+        "__psynch_mutexwait",
+        "kevent",
+        "kevent_id",
+        "kevent_qos",
+        "__select",
+        "__pselect",
+        "poll",
+        "ppoll",
+        "_pthread_cond_wait",
+    }
+)
 
-    if raw:
-        ms_per_unit = total_ms / total_weight if total_ms > 0 else 1
-        for symbol, weight, self_weight in raw:
-            frames.append(CallTreeFrame(symbol, self_weight * ms_per_unit, weight * ms_per_unit))
-        return frames, total_ms
 
-    node_pattern = re.compile(
-        r'<node[^>]*name="([^"]+)"[^>]*self-weight="([0-9.]+)ms"[^>]*total-weight="([0-9.]+)ms"'
-    )
-    for match in node_pattern.finditer(xml_content):
-        self_ms = float(match.group(2))
-        total = float(match.group(3))
-        total_ms = max(total_ms, total)
-        frames.append(CallTreeFrame(match.group(1), self_ms, total))
-
-    return frames, total_ms
+def _build_id_map(root: ET.Element) -> dict[str, ET.Element]:
+    return {elem.get("id"): elem for elem in root.iter() if elem.get("id")}  # type: ignore[misc]
 
 
-def _first_match(patterns: list[str], text: str, flags: int = 0) -> re.Match[str] | None:
-    for pattern in patterns:
-        match = re.search(pattern, text, flags)
-        if match:
-            return match
-    return None
+def _resolve(elem: ET.Element, id_map: dict[str, ET.Element]) -> ET.Element:
+    ref = elem.get("ref")
+    if ref is not None:
+        return id_map.get(ref, elem)
+    return elem
+
+
+def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float]:
+    """Parse xctrace --xpath '...time-profile' output into call-tree frames.
+
+    Each &lt;row&gt; is a sample with a &lt;weight&gt; (nanoseconds) and a &lt;tagged-backtrace&gt;.
+    The first &lt;frame&gt; in each backtrace is the leaf (innermost call), which receives
+    the self-time; every distinct frame in the sample receives the same weight as
+    total-time. Elements use id/ref deduplication so we resolve refs against an id map
+    built from the whole document.
+    """
+    if not xml_content.strip():
+        return [], 0.0
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return [], 0.0
+
+    id_map = _build_id_map(root)
+
+    self_ns: dict[str, int] = defaultdict(int)
+    total_ns: dict[str, int] = defaultdict(int)
+    total_duration_ns = 0
+
+    for row in root.iter("row"):
+        weight_elem = row.find("weight")
+        backtrace_elem = row.find("tagged-backtrace")
+        if weight_elem is None or backtrace_elem is None:
+            continue
+
+        # Only count samples where the thread was actually running on a CPU. Instruments
+        # records Blocked and Runnable samples too, but those represent wait/idle time
+        # and would heavily inflate totals on traces that include worker threads parked
+        # in mach_msg2_trap or semaphore_wait.
+        state_elem = row.find("thread-state")
+        if state_elem is not None:
+            state_resolved = _resolve(state_elem, id_map)
+            state_text = (state_resolved.text or "").strip()
+            if state_text and state_text != "Running":
+                continue
+
+        weight_resolved = _resolve(weight_elem, id_map)
+        try:
+            weight = int((weight_resolved.text or "0").strip())
+        except (AttributeError, ValueError):
+            continue
+        if weight <= 0:
+            continue
+
+        tagged_resolved = _resolve(backtrace_elem, id_map)
+        backtrace_inner = tagged_resolved.find("backtrace")
+        if backtrace_inner is None:
+            continue
+        backtrace_inner = _resolve(backtrace_inner, id_map)
+
+        sample_frames: list[str] = []
+        for frame_elem in backtrace_inner.findall("frame"):
+            frame_resolved = _resolve(frame_elem, id_map)
+            name = frame_resolved.get("name")
+            if not name or name == "<deduplicated_symbol>":
+                continue
+            sample_frames.append(name)
+
+        if not sample_frames:
+            continue
+
+        if sample_frames[0] in _IDLE_LEAF_SYMBOLS:
+            continue
+
+        total_duration_ns += weight
+        self_ns[sample_frames[0]] += weight
+
+        seen: set[str] = set()
+        for name in sample_frames:
+            if name in seen:
+                continue
+            seen.add(name)
+            total_ns[name] += weight
+
+    symbols = set(total_ns) | set(self_ns)
+    frames = [
+        CallTreeFrame(
+            symbol=symbol,
+            self_ms=self_ns.get(symbol, 0) / _NS_PER_MS,
+            total_ms=total_ns.get(symbol, 0) / _NS_PER_MS,
+        )
+        for symbol in symbols
+    ]
+    return frames, total_duration_ns / _NS_PER_MS
+
+
+_PRE_MAIN_MARKERS = (
+    "dyld",
+    "_dyld_",
+    "ImageLoader",
+    "MachO",
+    "mach_o::",
+    "PatchTable",
+    "swift_",  # swift_conformsToProtocol, swift_class_, swift_demangle, ...
+    "_swift_",
+    "swift::",  # Swift runtime namespace
+    "_objc_init",
+    "objc_initialize",
+    "load_images",
+    "initializeMainExecutable",
+    "Static Initializer",
+    "Apply Fixups",
+    "Map Image",
+    "thread_start",
+    "_pthread_start",
+    "_pthread_workqueue",
+    "getContextDescriptor",
+    "MetadataCache",
+    "+initialize",
+)
+
+
+def _classify_launch_phase(symbol: str) -> LaunchPhaseName:
+    if any(marker in symbol for marker in _PRE_MAIN_MARKERS):
+        return "pre-main"
+    if (
+        symbol.startswith("-[")
+        or "AppDelegate" in symbol
+        or "SceneDelegate" in symbol
+        or "UIApplication" in symbol
+        or "applicationDidFinishLaunching" in symbol
+        or "didFinishLaunchingWithOptions" in symbol
+    ):
+        return "post-main"
+    return "unknown"
 
 
 def parse_app_launch(
@@ -625,52 +770,53 @@ def parse_app_launch(
     offender_warning_ms: float = 100,
     offender_critical_ms: float = 300,
 ) -> LaunchAnalysis:
-    frames, parsed_total = parse_call_tree(xml_content)
-    launch_time_match = _first_match(
-        [r"launch-time[^>]*>([0-9.]+)", r"total[^>]*time[^>]*>([0-9.]+)"],
-        xml_content,
-        re.IGNORECASE,
-    )
-    total_launch_ms = (
-        float(launch_time_match.group(1)) * 1000 if launch_time_match else parsed_total or 0
-    )
+    """Parse an App Launch trace's time-profile export.
 
-    ms_per_unit = total_launch_ms / parsed_total if parsed_total > 0 else 1
-    seen: set[str] = set()
-    offenders: list[LaunchOffender] = []
+    The App Launch xctrace template exports the same `time-profile` schema that Time
+    Profiler does, so we reuse the same call-tree parser. We then classify each frame
+    into pre-main (dyld / static init / Swift runtime) vs post-main (AppDelegate /
+    UIApplication) by symbol heuristic to produce phase totals and per-offender phase
+    tags. Note: total_launch_ms here is CPU-active launch time, not wall-clock — the
+    xctrace export does not expose a clean "app became active" marker we can read.
+    """
+    frames, total_ms = parse_time_profile_xml(xml_content)
 
+    phase_self_ms: dict[LaunchPhaseName, float] = defaultdict(float)
     for frame in frames:
-        if frame.symbol in seen:
+        phase_self_ms[_classify_launch_phase(frame.symbol)] += frame.self_ms
+
+    offenders: list[LaunchOffender] = []
+    for frame in sorted(frames, key=lambda candidate: candidate.self_ms, reverse=True):
+        if frame.self_ms < 5:
             continue
-        seen.add(frame.symbol)
-        self_ms = frame.self_ms * ms_per_unit
-        if self_ms < 10:
-            continue
-        phase: LaunchPhaseName = (
-            "pre-main" if "+initialize" in frame.symbol or "dyld" in frame.symbol else "post-main"
-        )
+        if len(offenders) >= 15:
+            break
+        phase = _classify_launch_phase(frame.symbol)
         offenders.append(
             LaunchOffender(
                 symbol=frame.symbol,
-                self_time_ms=round(self_ms),
-                total_time_ms=round(frame.total_ms * ms_per_unit),
-                percent=round((self_ms / total_launch_ms) * 100) if total_launch_ms > 0 else 0,
+                self_time_ms=round(frame.self_ms),
+                total_time_ms=round(frame.total_ms),
+                percent=round((frame.self_ms / total_ms) * 100) if total_ms > 0 else 0,
                 phase=phase,
-                severity=get_severity(self_ms, offender_critical_ms, offender_warning_ms),
+                severity=get_severity(frame.self_ms, offender_critical_ms, offender_warning_ms),
                 suggestion=get_launch_suggestion(frame.symbol, phase),
             )
         )
 
-    offenders.sort(key=lambda offender: offender.self_time_ms, reverse=True)
-
-    phases = (
-        [
-            LaunchPhase("pre-main (dyld + static init)", round(total_launch_ms * 0.35), 35),
-            LaunchPhase("post-main (AppDelegate + UI)", round(total_launch_ms * 0.65), 65),
-        ]
-        if total_launch_ms > 0
-        else []
-    )
+    phases: list[LaunchPhase] = []
+    if total_ms > 0:
+        for phase_name in ("pre-main", "post-main", "unknown"):
+            duration = phase_self_ms.get(phase_name, 0.0)
+            if duration <= 0:
+                continue
+            phases.append(
+                LaunchPhase(
+                    name=_LAUNCH_PHASE_LABELS[phase_name],
+                    duration_ms=round(duration),
+                    percent=round((duration / total_ms) * 100),
+                )
+            )
 
     critical_count = sum(1 for offender in offenders if offender.severity == "critical")
     warning_count = sum(1 for offender in offenders if offender.severity == "warning")
@@ -683,25 +829,74 @@ def parse_app_launch(
         recommendations.append(
             f"{warning_count} method(s) between {offender_warning_ms:g}-{offender_critical_ms:g}ms - worth deferring to background."
         )
-    if any(offender.phase == "pre-main" for offender in offenders):
-        recommendations.append("Reduce static initializers: avoid +initialize, prefer lazy var in Swift.")
-    recommendations.append("Target: total launch under 400ms. Write XCTest performance tests to catch regressions.")
+    if phase_self_ms.get("pre-main", 0) > phase_self_ms.get("post-main", 0):
+        recommendations.append(
+            "Pre-main dominates: reduce static initializers, +load / +initialize, and Swift protocol conformance scans."
+        )
+    recommendations.append(
+        f"Target: launch CPU under {launch_good_ms:g}ms. Add XCTest performance tests to catch regressions."
+    )
 
-    status = get_status(total_launch_ms, launch_good_ms, launch_critical_ms)
+    status = get_status(total_ms, launch_good_ms, launch_critical_ms)
     if status == "good":
-        summary = f"✅ Launch time {round(total_launch_ms)}ms - within Apple's recommended threshold."
+        summary = f"✅ Launch CPU {round(total_ms)}ms - within target."
     elif status == "warning":
-        summary = f"⚠️ Launch time {round(total_launch_ms)}ms - above 400ms. Users may notice the delay."
+        summary = f"⚠️ Launch CPU {round(total_ms)}ms - above {launch_good_ms:g}ms target. Users may notice the delay."
     else:
-        summary = f"🔴 Launch time {round(total_launch_ms)}ms - critical. Apple may flag this in App Store review."
+        summary = f"🔴 Launch CPU {round(total_ms)}ms - heavy startup work. Apple may flag this in App Store review."
 
     return LaunchAnalysis(
-        total_launch_ms=round(total_launch_ms),
+        total_launch_ms=round(total_ms),
         status=status,
         phases=phases,
-        offenders=offenders[:15],
+        offenders=offenders,
         summary=summary,
         recommendations=recommendations,
+    )
+
+
+_LAUNCH_PHASE_LABELS: dict[LaunchPhaseName, str] = {
+    "pre-main": "pre-main (dyld + static init)",
+    "post-main": "post-main (AppDelegate + UI)",
+    "unknown": "uncategorized",
+}
+
+
+_UNSUPPORTED_TEMPLATES: dict[str, str] = {
+    "allocations": "Allocations",
+    "leaks": "Leaks",
+}
+
+
+def unsupported_template_report(template_kind: str, target_label: str) -> str:
+    """Stable error report for templates xctrace export cannot read."""
+    pretty = _UNSUPPORTED_TEMPLATES.get(template_kind, template_kind.title())
+    return "\n".join(
+        [
+            f"# {pretty} Analysis - {target_label}",
+            "",
+            f"## {pretty} is not available via `xctrace export`",
+            "",
+            f"`xcrun xctrace export` does not expose the {pretty} schema through `--xpath`. The",
+            "data is stored in binary form inside the .trace bundle and can only be read by",
+            "the Instruments GUI today. Open the trace in Instruments.app to view full",
+            f"{pretty.lower()} information.",
+            "",
+            "## Workarounds",
+            "",
+            *(
+                [
+                    "- Open the trace in Instruments.app for the full Allocations / VM Tracker view.",
+                    "- For programmatic memory snapshots, use Xcode's Memory Graph Debugger.",
+                    "- For runtime heap inspection on macOS, the `heap <pid>` command-line tool.",
+                ]
+                if template_kind == "allocations"
+                else [
+                    "- Open the trace in Instruments.app for the full Leaks view.",
+                    "- For runtime leak inspection on macOS, the `leaks <pid>` command-line tool.",
+                ]
+            ),
+        ]
     )
 
 
@@ -712,6 +907,10 @@ def parse_allocations(
     memory_critical_mb: float = 200,
     memory_cache_warning_mb: float = 150,
 ) -> AllocationAnalysis:
+    # TODO: Not yet validated against a real Allocations .trace export. The regex below
+    # was written against a fabricated XML shape; the real xctrace Allocations export
+    # uses one of the allocation/vm-op schemas with id/ref deduplication. Rewrite once
+    # a real Allocations trace is available.
     categories: list[AllocationCategory] = []
     peak_mb = 0.0
     live_mb = 0.0
@@ -776,6 +975,10 @@ def parse_allocations(
 
 
 def parse_leaks(xml_content: str, *, leak_critical_count: int = 10) -> LeaksAnalysis:
+    # TODO: Not yet validated against a real Leaks .trace export. The regex below
+    # matches a fabricated <leak type=...> shape; xctrace's Leaks template emits its
+    # own schema with separate symbol/responsible-frame rows. Rewrite once a real
+    # Leaks trace is available.
     leaks: list[LeakEntry] = []
     leak_pattern = re.compile(
         r'<leak[^>]*type="([^"]+)"[^>]*count="(\d+)"[^>]*size="(\d+)"[^>]*root-cycle="(true|false)"'
@@ -845,14 +1048,10 @@ def parse_time_profiler(
     method_warning_ms: float = 50,
     method_critical_ms: float = 200,
 ) -> TimeProfileAnalysis:
-    frames, total_ms = parse_call_tree(xml_content)
-    seen: set[str] = set()
+    frames, total_ms = parse_time_profile_xml(xml_content)
     hot_methods: list[HotMethod] = []
 
     for frame in frames:
-        if frame.symbol in seen:
-            continue
-        seen.add(frame.symbol)
         if frame.self_ms < 5:
             continue
         hot_methods.append(
@@ -899,6 +1098,11 @@ def parse_network(
     slow_request_critical_count: int = 5,
     transfer_warning_mb: float = 5,
 ) -> NetworkAnalysis:
+    # TODO: Not yet validated against a real Network .trace export. The regex below
+    # matches a fabricated <request url=... method=...> shape; xctrace's Network
+    # template emits nsurlsession-task-info / connection-event rows. xctrace also
+    # supports `--har` for HTTP Archive export which may be a better source. Rewrite
+    # once a real Network trace is available.
     requests: list[NetworkRequest] = []
     req_pattern = re.compile(
         r'<request[^>]*url="([^"]+)"[^>]*method="([^"]+)"[^>]*duration="([0-9.]+)"[^>]*bytes="(\d+)"[^>]*status="(\d+)"'
@@ -1199,6 +1403,7 @@ async def run_analysis(
     dry_run: bool = False,
     keep_trace: bool = False,
     output_dir: str | None = None,
+    xpath: str | None = None,
 ) -> str:
     base_dir = Path(os.path.expanduser(output_dir)) if output_dir else None
     if dry_run:
@@ -1236,10 +1441,18 @@ async def run_analysis(
 
     try:
         await record_trace(template, target, time_limit_seconds, trace_path)
-        with contextlib.suppress(Exception):
-            await export_xml(trace_path, xml_path)
+        export_error: str | None = None
+        try:
+            if xpath:
+                await export_xml(trace_path, xml_path, xpath=xpath)
+            else:
+                await export_xml(trace_path, xml_path, toc=True)
+        except Exception as exc:
+            export_error = str(exc)
         xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
         result = formatter(parser(xml_content))
+        if export_error:
+            result = f"{result}\n\n## Export Warning\n- xctrace export failed: {export_error}"
         quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
         quality_text = format_quality(quality)
         if quality_text:
@@ -1268,6 +1481,8 @@ async def analyze_existing(
     formatter: Callable[[T], str],
     parser_name: str,
     evidence_checker: Callable[[str], bool],
+    *,
+    xpath: str | None = None,
 ) -> str:
     expanded_trace_path = Path(os.path.expanduser(trace_path))
     if not expanded_trace_path.exists():
@@ -1277,13 +1492,23 @@ async def analyze_existing(
     xml_path = tmp_dir / "export.xml"
 
     try:
-        with contextlib.suppress(Exception):
-            await export_xml(expanded_trace_path, xml_path)
+        export_error: str | None = None
+        try:
+            if xpath:
+                await export_xml(expanded_trace_path, xml_path, xpath=xpath)
+            else:
+                await export_xml(expanded_trace_path, xml_path, toc=True)
+        except Exception as exc:
+            export_error = str(exc)
         xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
         result = formatter(parser(xml_content))
         quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
         quality_text = format_quality(quality)
-        return f"{result}\n{quality_text}" if quality_text else result
+        if quality_text:
+            result = f"{result}\n{quality_text}"
+        if export_error:
+            result = f"{result}\n\n## Export Warning\n- xctrace export failed: {export_error}"
+        return result
     except Exception as error:
         return f"Error analyzing trace: {error}"
     finally:
@@ -1297,6 +1522,8 @@ async def compare_existing(
     comparator: Callable[[T, T], str],
     parser_name: str,
     evidence_checker: Callable[[str], bool],
+    *,
+    xpath: str | None = None,
 ) -> str:
     baseline_path = Path(os.path.expanduser(baseline_trace_path))
     candidate_path = Path(os.path.expanduser(candidate_trace_path))
@@ -1309,11 +1536,19 @@ async def compare_existing(
     baseline_xml_path = tmp_dir / "baseline.xml"
     candidate_xml_path = tmp_dir / "candidate.xml"
 
+    async def _export(trace: Path, target: Path) -> str | None:
+        try:
+            if xpath:
+                await export_xml(trace, target, xpath=xpath)
+            else:
+                await export_xml(trace, target, toc=True)
+        except Exception as exc:
+            return str(exc)
+        return None
+
     try:
-        with contextlib.suppress(Exception):
-            await export_xml(baseline_path, baseline_xml_path)
-        with contextlib.suppress(Exception):
-            await export_xml(candidate_path, candidate_xml_path)
+        baseline_export_error = await _export(baseline_path, baseline_xml_path)
+        candidate_export_error = await _export(candidate_path, candidate_xml_path)
 
         baseline_xml = baseline_xml_path.read_text(encoding="utf-8") if baseline_xml_path.exists() else ""
         candidate_xml = candidate_xml_path.read_text(encoding="utf-8") if candidate_xml_path.exists() else ""
@@ -1324,6 +1559,12 @@ async def compare_existing(
         warnings = baseline_quality.warnings + candidate_quality.warnings
         if warnings:
             result = f"{result}\n{format_quality(AnalysisQuality(confidence='low', warnings=warnings))}"
+
+        export_errors = [error for error in (baseline_export_error, candidate_export_error) if error]
+        if export_errors:
+            lines = ["", "## Export Warning"]
+            lines.extend(f"- xctrace export failed: {error}" for error in export_errors)
+            result = f"{result}\n" + "\n".join(lines)
         return result
     except Exception as error:
         return f"Error comparing traces: {error}"

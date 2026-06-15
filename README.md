@@ -114,16 +114,16 @@ Compare ~/Desktop/baseline.trace and ~/Desktop/candidate.trace for launch regres
 | `profile_all_processes` | Selected by `profile_type` | Profiles all processes on the host or selected device. |
 | `analyze_launch` | App Launch | Records and analyzes app startup time. |
 | `analyze_launch_trace` | App Launch | Analyzes an existing App Launch `.trace`. |
-| `analyze_allocations` | Allocations | Records memory allocations and reports top allocation types. |
-| `analyze_allocations_trace` | Allocations | Analyzes an existing Allocations `.trace`. |
-| `analyze_leaks` | Leaks | Records leak information and reports likely retain-cycle issues. |
-| `analyze_leaks_trace` | Leaks | Analyzes an existing Leaks `.trace`. |
+| `analyze_allocations` | Allocations | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
+| `analyze_allocations_trace` | Allocations | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
+| `analyze_leaks` | Leaks | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
+| `analyze_leaks_trace` | Leaks | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
 | `analyze_time_profiler` | Time Profiler | Records CPU samples and reports hot methods. |
 | `analyze_time_profiler_trace` | Time Profiler | Analyzes an existing Time Profiler `.trace`. |
 | `analyze_network` | Network | Records network requests, latency, transfer sizes, and status codes. |
 | `analyze_network_trace` | Network | Analyzes an existing Network `.trace`. |
 | `compare_launch_traces` | App Launch | Compares two App Launch traces and reports startup deltas. |
-| `compare_memory_traces` | Allocations | Compares two Allocations traces and reports memory deltas. |
+| `compare_memory_traces` | Allocations | ❌ Not supported by `xctrace export` — returns an explanatory error. Use Instruments.app. |
 | `compare_cpu_traces` | Time Profiler | Compares two Time Profiler traces and reports CPU deltas. |
 | `build_xctrace_command` | Any | Returns the exact `xcrun xctrace record` command for a target without executing it. |
 
@@ -274,10 +274,28 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 
 - Temporary `.trace` bundles created by recording tools are cleaned up after each run.
 - All analysis is based on the XML exported by `xcrun xctrace export`.
-- The parsers support multiple XML shapes emitted by different Xcode/Instruments versions, but Instruments output can vary between releases.
-- Reports include an `Analysis Quality` section when the exported XML is empty or no recognizable data was found for the selected parser.
+- Reports include an `Analysis Quality` section when the exported XML is empty or no recognizable data was found for the selected parser. Export failures (for example, an unsupported xpath) are reported under `Export Warning`.
 - If you already have a trace, prefer the `_trace` tools to avoid recording again.
 - Current Xcode versions expect `xcrun xctrace record --output` paths to use the `.trace` extension; `.xctrace` may be rejected before recording starts.
+
+## Parser Status
+
+Each parser is wired to a specific `xctrace export --xpath` schema. The tooling has been validated end-to-end against real `.trace` bundles for the ✅ rows. The Allocations and Leaks tools intentionally short-circuit with an explanatory error message because Apple's `xctrace export` does not expose either of those data sets via xpath.
+
+| Template | xpath / schema | Status |
+| --- | --- | --- |
+| Time Profiler | `time-profile` | ✅ validated against real traces |
+| App Launch | `time-profile` (CPU samples, idle leaves filtered) | ✅ validated against real traces |
+| Allocations | n/a | ❌ not exposed by `xctrace export` — tool returns a clear "use Instruments.app" message |
+| Leaks | n/a | ❌ not exposed by `xctrace export` — tool returns a clear "use Instruments.app" message |
+| Network | (legacy regex) | ⚠️ not validated — pending a Network trace from a physical device (`xctrace export --har` is also worth considering) |
+
+### App Launch caveats
+
+The App Launch parser uses the same `time-profile` schema as Time Profiler and classifies frames into pre-main (dyld / static init / Swift runtime) vs post-main (AppDelegate / UIApplication / Cocoa methods) by symbol heuristic. Two things to keep in mind:
+
+- `total_launch_ms` is **CPU-active** launch time, not wall-clock. xctrace does not expose a clean "app became active" marker we can read.
+- Samples whose leaf frame is a known kernel wait (`mach_msg2_trap`, `start_wqthread`, `semaphore_wait_trap`, etc.) are dropped, matching Instruments' default "Hide System Libraries" behaviour. Without this, a long recording that idles after launch would dominate the totals with worker threads parked in wait.
 
 ## Troubleshooting
 
