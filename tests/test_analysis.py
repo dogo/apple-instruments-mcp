@@ -348,15 +348,20 @@ class AnalysisTests(unittest.TestCase):
         <trace-query-result>
           <node xpath='//trace-toc[1]/run[1]/tracks[1]/track[1]/details[1]/detail[1]'>
             <row category="Closure" count="2" size="4096" root-cycle="true"/>
+            <row leaked-object="ObservationRegistrar.Extent" count="1" size="32"/>
+            <row leaked-object="ObservationRegistrar.Extent" count="1" size="32"/>
             <row responsible-library="UIKit" count-persistent="1" persistent-bytes="2048"/>
           </node>
         </trace-query-result>"""
 
         analysis = parse_leaks(xml)
 
-        self.assertEqual(analysis.total_leaks, 3)
-        self.assertEqual(analysis.total_leaked_bytes, 6144)
+        self.assertEqual(analysis.total_leaks, 5)
+        self.assertEqual(analysis.total_leaked_bytes, 6208)
         self.assertTrue(analysis.leaks[0].root_cycle)
+        registrar = next(leak for leak in analysis.leaks if leak.type == "ObservationRegistrar.Extent")
+        self.assertEqual(registrar.count, 2)
+        self.assertEqual(registrar.total_bytes, 64)
 
     def test_parse_time_profiler_from_real_xctrace_xml(self) -> None:
         xml = _time_profile_fixture()

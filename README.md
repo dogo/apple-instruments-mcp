@@ -287,7 +287,7 @@ Each parser is wired to a specific `xctrace export --xpath` query. The tooling h
 | Time Profiler | `time-profile` | ✅ validated against real traces |
 | App Launch | `time-profile` (CPU samples, idle leaves filtered) | ✅ validated against real traces |
 | Allocations | `tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]` | ✅ validated against real traces |
-| Leaks | `tracks/track[@name="Leaks"]/details/detail` | ⚠️ best effort — pending a valid Leaks trace fixture |
+| Leaks | `tracks/track[@name="Leaks"]/details/detail[@name="Leaks"]` | ✅ validated against real traces |
 | Network | (legacy regex) | ⚠️ not validated — pending a Network trace from a physical device (`xctrace export --har` is also worth considering) |
 
 ### App Launch caveats

@@ -7,7 +7,7 @@ from apple_instruments_mcp.analysis.models import LeakEntry, LeaksAnalysis, Stat
 from apple_instruments_mcp.analysis.severity import get_leak_suggestion
 
 
-XPATH_LEAKS_DETAILS = '//trace-toc/run[@number="1"]/tracks/track[@name="Leaks"]/details/detail'
+XPATH_LEAKS_DETAILS = '/trace-toc/run[@number="1"]/tracks/track[@name="Leaks"]/details/detail[@name="Leaks"]'
 
 
 def has_leaks_evidence(xml_content: str) -> bool:
@@ -29,9 +29,11 @@ def parse_leaks(xml_content: str, *, leak_critical_count: int = 10) -> LeaksAnal
         for row in root.iter("row"):
             type_name = (
                 row.attrib.get("type")
+                or row.attrib.get("leaked-object")
                 or row.attrib.get("category")
                 or row.attrib.get("responsible-library")
                 or row.attrib.get("responsible-caller")
+                or row.attrib.get("responsible-frame")
             )
             size_value = (
                 row.attrib.get("size")
@@ -98,6 +100,22 @@ def parse_leaks(xml_content: str, *, leak_critical_count: int = 10) -> LeaksAnal
                 )
             )
 
+    grouped: dict[tuple[str, bool], LeakEntry] = {}
+    for leak in leaks:
+        key = (leak.type, leak.root_cycle)
+        existing = grouped.get(key)
+        if existing:
+            grouped[key] = LeakEntry(
+                type=leak.type,
+                count=existing.count + leak.count,
+                total_bytes=existing.total_bytes + leak.total_bytes,
+                root_cycle=existing.root_cycle or leak.root_cycle,
+                suggestion=existing.suggestion or leak.suggestion,
+            )
+        else:
+            grouped[key] = leak
+
+    leaks = list(grouped.values())
     leaks.sort(key=lambda leak: leak.total_bytes, reverse=True)
     total_leaks = sum(leak.count for leak in leaks)
     total_bytes = sum(leak.total_bytes for leak in leaks)
