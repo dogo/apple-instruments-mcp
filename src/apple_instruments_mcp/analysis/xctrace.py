@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import shlex
@@ -158,10 +159,8 @@ async def _terminate(process: asyncio.subprocess.Process) -> None:
         process.kill()
     except ProcessLookupError:
         return
-    try:
+    with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(process.wait(), timeout=2.0)
-    except TimeoutError:
-        pass
 
 
 async def _run_record_with_watchdog(
@@ -256,10 +255,8 @@ async def _watchdog_loop(
     finally:
         if not reader.done():
             reader.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reader
-            except (asyncio.CancelledError, Exception):
-                pass
 
 
 @dataclass(frozen=True)

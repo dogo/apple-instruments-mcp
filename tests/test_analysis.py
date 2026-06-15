@@ -28,8 +28,6 @@ from apple_instruments_mcp.analysis import (
 from apple_instruments_mcp.analysis import xctrace as xctrace_module
 from apple_instruments_mcp.analysis.xctrace import (
     PreflightFinding,
-    PreflightReport,
-    _run_record_with_watchdog,
     _watchdog_loop,
     find_stale_xctrace_pids,
     format_preflight_findings,
@@ -1086,9 +1084,9 @@ class RecordTraceCleanupTests(unittest.TestCase):
             mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
             mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
             tempfile.TemporaryDirectory() as tmp,
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(xctrace_module.record_trace("App Launch", target, 10, Path(tmp) / "t.trace"))
+            asyncio.run(xctrace_module.record_trace("App Launch", target, 10, Path(tmp) / "t.trace"))
 
         self.assertTrue(record_called)
         self.assertEqual(sweep_calls, ["sweep", "sweep"])
