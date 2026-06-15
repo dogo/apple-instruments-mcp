@@ -1202,7 +1202,7 @@ async def run_analysis(
 ) -> str:
     base_dir = Path(os.path.expanduser(output_dir)) if output_dir else None
     if dry_run:
-        trace_path = (base_dir / "trace.xctrace") if base_dir else Path("<temporary-directory>") / "trace.xctrace"
+        trace_path = (base_dir / "trace.trace") if base_dir else Path("<temporary-directory>") / "trace.trace"
         command = format_command(build_record_command(template, target, time_limit_seconds, trace_path))
         return "\n".join(
             [
@@ -1231,7 +1231,7 @@ async def run_analysis(
     if base_dir:
         base_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
-    trace_path = tmp_dir / "trace.xctrace"
+    trace_path = tmp_dir / "trace.trace"
     xml_path = tmp_dir / "export.xml"
 
     try:

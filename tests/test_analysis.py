@@ -65,7 +65,7 @@ class AnalysisTests(unittest.TestCase):
         target = RecordingTarget.build(process_name="MyMacApp")
 
         self.assertEqual(
-            build_record_command("Time Profiler", target, 10, Path("/tmp/trace.xctrace")),
+            build_record_command("Time Profiler", target, 10, Path("/tmp/trace.trace")),
             [
                 "xcrun",
                 "xctrace",
@@ -75,7 +75,7 @@ class AnalysisTests(unittest.TestCase):
                 "--time-limit",
                 "10s",
                 "--output",
-                "/tmp/trace.xctrace",
+                "/tmp/trace.trace",
                 "--attach",
                 "MyMacApp",
             ],
@@ -99,6 +99,7 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertIn("# xctrace Dry Run", output)
         self.assertIn("xcrun xctrace record", output)
+        self.assertIn("trace.trace", output)
         self.assertIn("/Applications/MyApp.app", output)
 
     def test_analysis_quality_reports_empty_xml(self) -> None:

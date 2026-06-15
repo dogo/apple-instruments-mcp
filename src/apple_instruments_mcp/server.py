@@ -92,9 +92,9 @@ TimeLimitSeconds = Annotated[
     int,
     Field(default=20, ge=5, le=120, description="Recording duration in seconds."),
 ]
-TracePath = Annotated[str, Field(description="Absolute path to the .xctrace file.")]
-BaselineTracePath = Annotated[str, Field(description="Absolute path to the baseline .xctrace file.")]
-CandidateTracePath = Annotated[str, Field(description="Absolute path to the candidate .xctrace file.")]
+TracePath = Annotated[str, Field(description="Absolute path to the .trace bundle.")]
+BaselineTracePath = Annotated[str, Field(description="Absolute path to the baseline .trace bundle.")]
+CandidateTracePath = Annotated[str, Field(description="Absolute path to the candidate .trace bundle.")]
 ProfileType = Annotated[
     Literal["launch", "allocations", "leaks", "time_profiler", "network"],
     Field(description="Analysis type to run."),
@@ -264,7 +264,7 @@ def build_xctrace_command(
     time_limit_seconds: TimeLimitSeconds = 20,
     output_path: Annotated[
         str | None,
-        Field(description="Optional absolute path for the .xctrace output. Defaults to a placeholder."),
+        Field(description="Optional absolute path for the .trace output. Defaults to a placeholder."),
     ] = None,
 ) -> str:
     """Build the exact `xcrun xctrace record ...` command for the given target without executing it."""
@@ -281,7 +281,7 @@ def build_xctrace_command(
     except ValueError as error:
         return f"Invalid target: {error}"
 
-    trace_path = Path(output_path) if output_path else Path("<output-path>") / "trace.xctrace"
+    trace_path = Path(output_path) if output_path else Path("<output-path>") / "trace.trace"
     command = format_command(build_record_command(template, target, time_limit_seconds, trace_path))
 
     validation_errors = target.validate()
@@ -448,7 +448,7 @@ async def analyze_launch_trace(
     offender_warning_ms: OffenderWarningMs = 100,
     offender_critical_ms: OffenderCriticalMs = 300,
 ) -> str:
-    """Analyze an existing .xctrace file recorded with the App Launch template."""
+    """Analyze an existing .trace bundle recorded with the App Launch template."""
     return await analyze_existing(
         trace_path,
         lambda xml: parse_app_launch(
@@ -519,7 +519,7 @@ async def analyze_allocations_trace(
     memory_critical_mb: MemoryCriticalMb = 200,
     memory_cache_warning_mb: MemoryCacheWarningMb = 150,
 ) -> str:
-    """Analyze an existing .xctrace file recorded with the Allocations template."""
+    """Analyze an existing .trace bundle recorded with the Allocations template."""
     return await analyze_existing(
         trace_path,
         lambda xml: parse_allocations(
@@ -579,7 +579,7 @@ async def analyze_leaks_trace(
     bundle_id: Annotated[str, Field(description="Target name used in the report.")] = "unknown target",
     leak_critical_count: LeakCriticalCount = 10,
 ) -> str:
-    """Analyze an existing .xctrace file recorded with the Leaks template."""
+    """Analyze an existing .trace bundle recorded with the Leaks template."""
     return await analyze_existing(
         trace_path,
         lambda xml: parse_leaks(xml, leak_critical_count=leak_critical_count),
@@ -646,7 +646,7 @@ async def analyze_time_profiler_trace(
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
 ) -> str:
-    """Analyze an existing .xctrace file recorded with the Time Profiler template."""
+    """Analyze an existing .trace bundle recorded with the Time Profiler template."""
     return await analyze_existing(
         trace_path,
         lambda xml: parse_time_profiler(
@@ -719,7 +719,7 @@ async def analyze_network_trace(
     slow_request_critical_count: SlowRequestCriticalCount = 5,
     transfer_warning_mb: TransferWarningMb = 5,
 ) -> str:
-    """Analyze an existing .xctrace file recorded with the Network template."""
+    """Analyze an existing .trace bundle recorded with the Network template."""
     return await analyze_existing(
         trace_path,
         lambda xml: parse_network(
@@ -745,7 +745,7 @@ async def compare_launch_traces(
     offender_warning_ms: OffenderWarningMs = 100,
     offender_critical_ms: OffenderCriticalMs = 300,
 ) -> str:
-    """Compare two App Launch .xctrace files and report launch-time deltas."""
+    """Compare two App Launch .trace bundles and report launch-time deltas."""
     return await compare_existing(
         baseline_trace_path,
         candidate_trace_path,
@@ -772,7 +772,7 @@ async def compare_memory_traces(
     memory_critical_mb: MemoryCriticalMb = 200,
     memory_cache_warning_mb: MemoryCacheWarningMb = 150,
 ) -> str:
-    """Compare two Allocations .xctrace files and report memory deltas."""
+    """Compare two Allocations .trace bundles and report memory deltas."""
     return await compare_existing(
         baseline_trace_path,
         candidate_trace_path,
@@ -798,7 +798,7 @@ async def compare_cpu_traces(
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
 ) -> str:
-    """Compare two Time Profiler .xctrace files and report CPU hot-method deltas."""
+    """Compare two Time Profiler .trace bundles and report CPU hot-method deltas."""
     return await compare_existing(
         baseline_trace_path,
         candidate_trace_path,

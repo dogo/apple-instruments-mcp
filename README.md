@@ -1,13 +1,13 @@
 # apple-instruments-mcp
 
-`apple-instruments-mcp` is a Python MCP server for profiling Apple platform apps and processes with Instruments through `xcrun xctrace`. It lets MCP clients such as Claude Desktop record traces, inspect existing `.xctrace` bundles, and return concise performance reports with actionable recommendations.
+`apple-instruments-mcp` is a Python MCP server for profiling Apple platform apps and processes with Instruments through `xcrun xctrace`. It lets MCP clients such as Claude Desktop record traces, inspect existing `.trace` bundles, and return concise performance reports with actionable recommendations.
 
 The server can target iOS, iPadOS, macOS, tvOS, watchOS, visionOS, simulators, physical devices, and host processes when those targets are visible to the installed Xcode/Instruments toolchain. Actual template and device support is determined by `xcrun xctrace list devices` and `xcrun xctrace list templates` on your Mac.
 
 ## Features
 
 - Record new traces with `xctrace` from an MCP client.
-- Analyze existing `.xctrace` files without recording again.
+- Analyze existing `.trace` bundles without recording again.
 - Report launch time, memory allocations, leaks, CPU hot spots, and network activity.
 - Launch apps by bundle ID or executable path.
 - Attach to running processes by process name or PID.
@@ -15,7 +15,7 @@ The server can target iOS, iPadOS, macOS, tvOS, watchOS, visionOS, simulators, p
 - List available devices, simulators, runtimes, and Instruments templates.
 - Return raw or JSON-structured device/template listings.
 - Preview the generated `xctrace` command with `dry_run`.
-- Keep `.xctrace` and XML artifacts for later inspection.
+- Keep `.trace` and XML artifacts for later inspection.
 - Return human-readable summaries with top offenders and suggested fixes.
 - Runs as a standard stdio MCP server.
 
@@ -96,8 +96,8 @@ Attach Allocations to the running process named MyMacApp for 30 seconds.
 Attach Time Profiler to PID 1234.
 Record all processes with Time Profiler for 10 seconds.
 Analyze network activity for com.example.app and flag slow requests.
-Analyze the existing trace at ~/Desktop/launch.xctrace.
-Compare ~/Desktop/baseline.xctrace and ~/Desktop/candidate.xctrace for launch regressions.
+Analyze the existing trace at ~/Desktop/launch.trace.
+Compare ~/Desktop/baseline.trace and ~/Desktop/candidate.trace for launch regressions.
 ```
 
 ## Tools
@@ -113,15 +113,15 @@ Compare ~/Desktop/baseline.xctrace and ~/Desktop/candidate.xctrace for launch re
 | `profile_process` | Selected by `profile_type` | Profiles a running process by process name or PID. |
 | `profile_all_processes` | Selected by `profile_type` | Profiles all processes on the host or selected device. |
 | `analyze_launch` | App Launch | Records and analyzes app startup time. |
-| `analyze_launch_trace` | App Launch | Analyzes an existing App Launch `.xctrace`. |
+| `analyze_launch_trace` | App Launch | Analyzes an existing App Launch `.trace`. |
 | `analyze_allocations` | Allocations | Records memory allocations and reports top allocation types. |
-| `analyze_allocations_trace` | Allocations | Analyzes an existing Allocations `.xctrace`. |
+| `analyze_allocations_trace` | Allocations | Analyzes an existing Allocations `.trace`. |
 | `analyze_leaks` | Leaks | Records leak information and reports likely retain-cycle issues. |
-| `analyze_leaks_trace` | Leaks | Analyzes an existing Leaks `.xctrace`. |
+| `analyze_leaks_trace` | Leaks | Analyzes an existing Leaks `.trace`. |
 | `analyze_time_profiler` | Time Profiler | Records CPU samples and reports hot methods. |
-| `analyze_time_profiler_trace` | Time Profiler | Analyzes an existing Time Profiler `.xctrace`. |
+| `analyze_time_profiler_trace` | Time Profiler | Analyzes an existing Time Profiler `.trace`. |
 | `analyze_network` | Network | Records network requests, latency, transfer sizes, and status codes. |
-| `analyze_network_trace` | Network | Analyzes an existing Network `.xctrace`. |
+| `analyze_network_trace` | Network | Analyzes an existing Network `.trace`. |
 | `compare_launch_traces` | App Launch | Compares two App Launch traces and reports startup deltas. |
 | `compare_memory_traces` | Allocations | Compares two Allocations traces and reports memory deltas. |
 | `compare_cpu_traces` | Time Profiler | Compares two Time Profiler traces and reports CPU deltas. |
@@ -143,7 +143,7 @@ Additional recording arguments:
 - `launch_args`: optional shell-style arguments passed after `launch_path`.
 - `time_limit_seconds`: recording duration, from 5 to 120 seconds. Defaults to 20.
 - `dry_run`: return the generated `xctrace` command without recording.
-- `keep_trace`: keep generated `.xctrace` and XML artifacts, and include their paths in the report.
+- `keep_trace`: keep generated `.trace` and XML artifacts, and include their paths in the report.
 - `output_dir`: optional parent directory for generated artifacts. Each run creates a dedicated subdirectory inside it.
 
 Examples:
@@ -223,21 +223,21 @@ Example:
 
 Trace analysis tools accept:
 
-- `trace_path`: absolute path to an existing `.xctrace` bundle.
+- `trace_path`: absolute path to an existing `.trace` bundle.
 - `bundle_id`: optional target name used in the generated report.
 
 Trace comparison tools accept:
 
-- `baseline_trace_path`: absolute path to the baseline `.xctrace` bundle.
-- `candidate_trace_path`: absolute path to the candidate `.xctrace` bundle.
+- `baseline_trace_path`: absolute path to the baseline `.trace` bundle.
+- `candidate_trace_path`: absolute path to the candidate `.trace` bundle.
 - `bundle_id`: optional target name used in the generated report.
 
 Example:
 
 ```json
 {
-  "baseline_trace_path": "~/Desktop/baseline.xctrace",
-  "candidate_trace_path": "~/Desktop/candidate.xctrace",
+  "baseline_trace_path": "~/Desktop/baseline.trace",
+  "candidate_trace_path": "~/Desktop/candidate.trace",
   "bundle_id": "com.example.app"
 }
 ```
@@ -272,11 +272,12 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 
 ## Notes
 
-- Temporary `.xctrace` files created by recording tools are cleaned up after each run.
+- Temporary `.trace` bundles created by recording tools are cleaned up after each run.
 - All analysis is based on the XML exported by `xcrun xctrace export`.
 - The parsers support multiple XML shapes emitted by different Xcode/Instruments versions, but Instruments output can vary between releases.
 - Reports include an `Analysis Quality` section when the exported XML is empty or no recognizable data was found for the selected parser.
 - If you already have a trace, prefer the `_trace` tools to avoid recording again.
+- Current Xcode versions expect `xcrun xctrace record --output` paths to use the `.trace` extension; `.xctrace` may be rejected before recording starts.
 
 ## Troubleshooting
 
