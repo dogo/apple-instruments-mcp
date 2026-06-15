@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 from apple_instruments_mcp.analysis import (
@@ -1153,26 +1154,11 @@ class _FakeProcess:
         self._wait_event.set()
 
 
+def _as_process(fake: _FakeProcess) -> asyncio.subprocess.Process:
+    return cast(asyncio.subprocess.Process, fake)
+
+
 class WatchdogLoopTests(unittest.TestCase):
-    def _run(self, process: _FakeProcess, **overrides) -> None:
-        kwargs = dict(
-            time_limit_seconds=1,
-            startup_timeout=2.0,
-            teardown_grace=2.0,
-            poll_interval=0.05,
-        )
-        kwargs.update(overrides)
-
-        async def driver() -> None:
-            task = asyncio.create_task(_watchdog_loop(process, **kwargs))
-            # Wait for the reader to drain the script, then signal natural exit.
-            await asyncio.sleep(0.4)
-            if not task.done():
-                process.finish_naturally()
-            await task
-
-        asyncio.run(driver())
-
     def test_happy_path_completes_when_process_exits_cleanly(self) -> None:
         process = _FakeProcess(
             [
@@ -1183,7 +1169,22 @@ class WatchdogLoopTests(unittest.TestCase):
             ]
         )
 
-        self._run(process)
+        async def driver() -> None:
+            task = asyncio.create_task(
+                _watchdog_loop(
+                    _as_process(process),
+                    time_limit_seconds=1,
+                    startup_timeout=2.0,
+                    teardown_grace=2.0,
+                    poll_interval=0.05,
+                )
+            )
+            await asyncio.sleep(0.4)
+            if not task.done():
+                process.finish_naturally()
+            await task
+
+        asyncio.run(driver())
         self.assertFalse(process.kill_called)
 
     def test_kills_when_starting_recording_never_appears(self) -> None:
@@ -1197,7 +1198,7 @@ class WatchdogLoopTests(unittest.TestCase):
         async def driver() -> None:
             with self.assertRaises(RuntimeError) as ctx:
                 await _watchdog_loop(
-                    process,
+                    _as_process(process),
                     time_limit_seconds=1,
                     startup_timeout=0.3,
                     teardown_grace=10.0,
@@ -1220,7 +1221,7 @@ class WatchdogLoopTests(unittest.TestCase):
         async def driver() -> None:
             with self.assertRaises(RuntimeError) as ctx:
                 await _watchdog_loop(
-                    process,
+                    _as_process(process),
                     time_limit_seconds=1,
                     startup_timeout=10.0,
                     teardown_grace=0.3,
@@ -1245,7 +1246,7 @@ class WatchdogLoopTests(unittest.TestCase):
         async def driver() -> None:
             task = asyncio.create_task(
                 _watchdog_loop(
-                    process,
+                    _as_process(process),
                     time_limit_seconds=1,
                     startup_timeout=2.0,
                     teardown_grace=2.0,

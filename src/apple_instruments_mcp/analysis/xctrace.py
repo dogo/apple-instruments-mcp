@@ -202,7 +202,8 @@ async def _watchdog_loop(
     teardown_grace: float,
     poll_interval: float,
 ) -> None:
-    assert process.stdout is not None
+    stdout = process.stdout
+    assert stdout is not None
     lines: list[str] = []
     started = False
     started_at: float | None = None
@@ -212,7 +213,7 @@ async def _watchdog_loop(
     async def read_lines() -> None:
         nonlocal started, started_at
         while True:
-            chunk = await process.stdout.readline()
+            chunk = await stdout.readline()
             if not chunk:
                 return
             text = chunk.decode("utf-8", errors="replace")
