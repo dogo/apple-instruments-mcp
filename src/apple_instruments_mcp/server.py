@@ -120,6 +120,45 @@ RequestWarningMs = Annotated[float, Field(ge=0, description="Request duration ab
 RequestCriticalMs = Annotated[float, Field(ge=0, description="Request duration above this value is critical.")]
 SlowRequestCriticalCount = Annotated[int, Field(ge=0, description="Slow request count above this value is critical.")]
 TransferWarningMb = Annotated[float, Field(ge=0, description="Transferred data above this value adds a transfer-size recommendation.")]
+ScopeStartMs = Annotated[
+    int | None,
+    Field(
+        default=None,
+        description=(
+            "Optional inclusive lower bound (ms since trace start) for sample analysis. "
+            "Use with `scope_end_ms` to zoom into a specific window (e.g. a jank around second 12)."
+        ),
+    ),
+]
+ScopeEndMs = Annotated[
+    int | None,
+    Field(
+        default=None,
+        description=(
+            "Optional inclusive upper bound (ms since trace start) for sample analysis. "
+            "Omit or set to 0 to extend to the end of the trace."
+        ),
+    ),
+]
+HangThresholdMs = Annotated[
+    int,
+    Field(
+        ge=1,
+        description=(
+            "Main-thread inter-sample gap (ms) above which the gap is counted as a candidate stall. "
+            "Default 250 mirrors typical hang-instrument settings."
+        ),
+    ),
+]
+UserBinaries = Annotated[
+    str,
+    Field(
+        description=(
+            "Comma-separated binary names that count as 'user code' for the user-methods view "
+            "(e.g. `MyApp,MyAppKit`). Empty disables the user-methods section."
+        ),
+    ),
+]
 
 
 def make_target(
@@ -605,6 +644,10 @@ async def analyze_leaks_trace(
     )
 
 
+def _split_user_binaries(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
 @mcp.tool()
 async def analyze_time_profiler(
     bundle_id: BundleId = None,
@@ -622,6 +665,10 @@ async def analyze_time_profiler(
     total_critical_ms: TotalCpuCriticalMs = 100,
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
+    scope_start_ms: ScopeStartMs = None,
+    scope_end_ms: ScopeEndMs = None,
+    hang_threshold_ms: HangThresholdMs = 250,
+    user_binaries: UserBinaries = "",
 ) -> str:
     """Record a Time Profiler trace and report CPU hot methods."""
     target = make_target(
@@ -633,6 +680,7 @@ async def analyze_time_profiler(
         pid=pid,
         all_processes=all_processes,
     )
+    binaries = _split_user_binaries(user_binaries)
     return await run_analysis(
         "Time Profiler",
         target,
@@ -643,6 +691,10 @@ async def analyze_time_profiler(
             total_critical_ms=total_critical_ms,
             method_warning_ms=method_warning_ms,
             method_critical_ms=method_critical_ms,
+            start_ms=scope_start_ms,
+            end_ms=scope_end_ms,
+            hang_threshold_ms=hang_threshold_ms,
+            user_binaries=binaries,
         ),
         lambda analysis: format_time_profiler(analysis, target.label),
         "time profiler",
@@ -662,8 +714,13 @@ async def analyze_time_profiler_trace(
     total_critical_ms: TotalCpuCriticalMs = 100,
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
+    scope_start_ms: ScopeStartMs = None,
+    scope_end_ms: ScopeEndMs = None,
+    hang_threshold_ms: HangThresholdMs = 250,
+    user_binaries: UserBinaries = "",
 ) -> str:
     """Analyze an existing .trace bundle recorded with the Time Profiler template."""
+    binaries = _split_user_binaries(user_binaries)
     return await analyze_existing(
         trace_path,
         lambda xml: parse_time_profiler(
@@ -672,6 +729,10 @@ async def analyze_time_profiler_trace(
             total_critical_ms=total_critical_ms,
             method_warning_ms=method_warning_ms,
             method_critical_ms=method_critical_ms,
+            start_ms=scope_start_ms,
+            end_ms=scope_end_ms,
+            hang_threshold_ms=hang_threshold_ms,
+            user_binaries=binaries,
         ),
         lambda analysis: format_time_profiler(analysis, bundle_id),
         "time profiler",

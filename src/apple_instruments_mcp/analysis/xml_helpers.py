@@ -3,7 +3,13 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
-from apple_instruments_mcp.analysis.models import CallTreeFrame
+from apple_instruments_mcp.analysis.models import (
+    CallTreeFrame,
+    SampleFrame,
+    TimeProfileSample,
+)
+
+_MAIN_THREAD_HINTS = ("main thread", "com.apple.main-thread")
 
 _NS_PER_MS = 1_000_000
 
@@ -47,14 +53,68 @@ def _resolve(elem: ET.Element, id_map: dict[str, ET.Element]) -> ET.Element:
     return elem
 
 
-def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float]:
-    """Parse xctrace --xpath '...time-profile' output into call-tree frames.
+def _frame_binary(frame_elem: ET.Element, id_map: dict[str, ET.Element]) -> str:
+    """Best-effort binary name for a frame. xctrace's export shape varies:
+    sometimes a `binary` attribute, sometimes a `<binary name="...">` child,
+    sometimes a sibling `binary` element referenced by ref. Return "" when
+    none of these are present."""
+    binary_attr = frame_elem.get("binary")
+    if binary_attr:
+        return binary_attr
+    binary_child = frame_elem.find("binary")
+    if binary_child is not None:
+        resolved = _resolve(binary_child, id_map)
+        name = resolved.get("name")
+        if name:
+            return name
+    return ""
 
-    Each &lt;row&gt; is a sample with a &lt;weight&gt; (nanoseconds) and a &lt;tagged-backtrace&gt;.
-    The first &lt;frame&gt; in each backtrace is the leaf (innermost call), which receives
-    the self-time; every distinct frame in the sample receives the same weight as
-    total-time. Elements use id/ref deduplication so we resolve refs against an id map
-    built from the whole document.
+
+def _thread_descriptor(row: ET.Element, id_map: dict[str, ET.Element]) -> tuple[str, bool]:
+    """Extract (thread_name, is_main_thread) from a row. xctrace stores thread
+    info under various shapes; we look for an explicit name first, then fall
+    back to `tid` 0/1 as a weak signal."""
+    thread_elem = row.find("thread")
+    if thread_elem is None:
+        return "", False
+    resolved = _resolve(thread_elem, id_map)
+    name = resolved.get("name") or ""
+    if not name:
+        name_child = resolved.find("name")
+        if name_child is not None:
+            name_resolved = _resolve(name_child, id_map)
+            name = (name_resolved.text or "").strip()
+    if not name:
+        name_attr_child = resolved.find("thread-name")
+        if name_attr_child is not None:
+            name_resolved = _resolve(name_attr_child, id_map)
+            name = (name_resolved.text or "").strip()
+    is_main = any(hint in name.lower() for hint in _MAIN_THREAD_HINTS) if name else False
+    return name, is_main
+
+
+def _start_time_ns(row: ET.Element, id_map: dict[str, ET.Element]) -> int:
+    """`start-time` is exported as integer nanoseconds since the run start.
+    Return 0 when missing — callers treat that as "no timing information"."""
+    elem = row.find("start-time")
+    if elem is None:
+        return 0
+    resolved = _resolve(elem, id_map)
+    try:
+        return int((resolved.text or "0").strip())
+    except (AttributeError, ValueError):
+        return 0
+
+
+def parse_time_profile_samples(
+    xml_content: str,
+) -> tuple[list[TimeProfileSample], float]:
+    """Parse xctrace's time-profile export into per-sample records.
+
+    Each &lt;row&gt; is one sample (a periodic snapshot of a single running thread).
+    Returns the list of samples plus the total Running-state weight in
+    milliseconds. Idle leaf samples and non-Running thread states are dropped
+    here — they're noise for any downstream view (hot methods, hangs, scope).
     """
     if not xml_content.strip():
         return [], 0.0
@@ -64,9 +124,7 @@ def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float
         return [], 0.0
 
     id_map = _build_id_map(root)
-
-    self_ns: dict[str, int] = defaultdict(int)
-    total_ns: dict[str, int] = defaultdict(int)
+    samples: list[TimeProfileSample] = []
     total_duration_ns = 0
 
     for row in root.iter("row"):
@@ -75,10 +133,6 @@ def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float
         if weight_elem is None or backtrace_elem is None:
             continue
 
-        # Only count samples where the thread was actually running on a CPU. Instruments
-        # records Blocked and Runnable samples too, but those represent wait/idle time
-        # and would heavily inflate totals on traces that include worker threads parked
-        # in mach_msg2_trap or semaphore_wait.
         state_elem = row.find("thread-state")
         if state_elem is not None:
             state_resolved = _resolve(state_elem, id_map)
@@ -100,29 +154,60 @@ def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float
             continue
         backtrace_inner = _resolve(backtrace_inner, id_map)
 
-        sample_frames: list[str] = []
+        sample_frames: list[SampleFrame] = []
         for frame_elem in backtrace_inner.findall("frame"):
             frame_resolved = _resolve(frame_elem, id_map)
             name = frame_resolved.get("name")
             if not name or name == "<deduplicated_symbol>":
                 continue
-            sample_frames.append(name)
+            sample_frames.append(SampleFrame(symbol=name, binary=_frame_binary(frame_resolved, id_map)))
 
         if not sample_frames:
             continue
-
-        if sample_frames[0] in _IDLE_LEAF_SYMBOLS:
+        if sample_frames[0].symbol in _IDLE_LEAF_SYMBOLS:
             continue
 
+        thread_name, is_main = _thread_descriptor(row, id_map)
         total_duration_ns += weight
-        self_ns[sample_frames[0]] += weight
+        samples.append(
+            TimeProfileSample(
+                weight_ns=weight,
+                frames=tuple(sample_frames),
+                time_ns=_start_time_ns(row, id_map),
+                thread_name=thread_name,
+                is_main_thread=is_main,
+            )
+        )
+
+    return samples, total_duration_ns / _NS_PER_MS
+
+
+def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float]:
+    """Aggregate per-sample records into self/total weight per symbol.
+
+    Kept as the legacy entry point for callers that only want the call-tree
+    view; new code should prefer `parse_time_profile_samples`.
+    """
+    samples, total_ms = parse_time_profile_samples(xml_content)
+    if not samples:
+        return [], total_ms
+
+    self_ns: dict[str, int] = defaultdict(int)
+    total_ns: dict[str, int] = defaultdict(int)
+    binary_for: dict[str, str] = {}
+
+    for sample in samples:
+        leaf = sample.frames[0]
+        self_ns[leaf.symbol] += sample.weight_ns
+        binary_for.setdefault(leaf.symbol, leaf.binary)
 
         seen: set[str] = set()
-        for name in sample_frames:
-            if name in seen:
+        for frame in sample.frames:
+            if frame.symbol in seen:
                 continue
-            seen.add(name)
-            total_ns[name] += weight
+            seen.add(frame.symbol)
+            total_ns[frame.symbol] += sample.weight_ns
+            binary_for.setdefault(frame.symbol, frame.binary)
 
     symbols = set(total_ns) | set(self_ns)
     frames = [
@@ -130,7 +215,8 @@ def parse_time_profile_xml(xml_content: str) -> tuple[list[CallTreeFrame], float
             symbol=symbol,
             self_ms=self_ns.get(symbol, 0) / _NS_PER_MS,
             total_ms=total_ns.get(symbol, 0) / _NS_PER_MS,
+            binary=binary_for.get(symbol, ""),
         )
         for symbol in symbols
     ]
-    return frames, total_duration_ns / _NS_PER_MS
+    return frames, total_ms

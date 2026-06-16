@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 Severity = Literal["critical", "warning", "ok"]
@@ -13,6 +13,26 @@ class CallTreeFrame:
     symbol: str
     self_ms: float
     total_ms: float
+    binary: str = ""
+
+
+@dataclass(frozen=True)
+class SampleFrame:
+    symbol: str
+    binary: str = ""
+
+
+@dataclass(frozen=True)
+class TimeProfileSample:
+    """A single Time Profiler row, leaf-first frames. `time_ns` is the offset
+    from the start of the run; 0 when xctrace's export didn't carry start-time
+    (older fixtures, some templates)."""
+
+    weight_ns: int
+    frames: tuple[SampleFrame, ...]
+    time_ns: int = 0
+    thread_name: str = ""
+    is_main_thread: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +111,32 @@ class HotMethod:
     percent: int
     severity: Severity
     suggestion: str | None = None
+    binary: str = ""
+    is_user: bool = False
+
+
+@dataclass(frozen=True)
+class MainThreadStats:
+    """Approximate stall signal derived from Time Profiler samples. The
+    profiler only samples *running* threads, so a long gap between consecutive
+    main-thread samples is a candidate stall, not a confirmed hang."""
+
+    samples: int
+    weight_ms: int
+    weight_pct: float
+    max_gap_ms: int
+    gap_threshold_ms: int
+    candidate_stalls: int
+
+
+@dataclass(frozen=True)
+class ScopeInfo:
+    """Window applied via --start-ms / --end-ms when the LLM zooms into one
+    moment of the trace instead of analyzing the whole recording."""
+
+    start_ms: int
+    end_ms: int
+    samples_in_scope: int
 
 
 @dataclass(frozen=True)
@@ -100,6 +146,9 @@ class TimeProfileAnalysis:
     hot_methods: list[HotMethod]
     summary: str
     recommendations: list[str]
+    user_methods: list[HotMethod] = field(default_factory=list)
+    main_thread: MainThreadStats | None = None
+    scope: ScopeInfo | None = None
 
 
 @dataclass(frozen=True)

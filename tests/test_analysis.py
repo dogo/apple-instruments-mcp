@@ -16,6 +16,7 @@ from apple_instruments_mcp.analysis import (
     compare_time_profile_analyses,
     format_quality,
     format_target_error,
+    format_time_profiler,
     has_allocations_evidence,
     has_time_profiler_evidence,
     list_as_json,
@@ -636,6 +637,172 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertIn("CPU Trace Comparison", output)
         self.assertIn("-40ms (improvement)", output)
+
+
+def _enriched_time_profile_fixture() -> str:
+    """Fixture mirroring xctrace's real export shape when start-time, thread,
+    and binary attributes are present. Six 50ms samples laid out so the
+    scope/hangs/user-frame tests have signal:
+
+      t=  100ms  Main Thread      Work.run @ MyApp -> Root @ MyApp
+      t=  500ms  Main Thread      Work.run @ MyApp -> Root @ MyApp
+      t= 4000ms  Main Thread      Work.run @ MyApp -> Root @ MyApp   (3.5s gap → stall)
+      t= 4050ms  Main Thread      Work.run @ MyApp -> Root @ MyApp
+      t= 4100ms  com.acme.queue   bg_step  @ libsystem -> Root @ MyApp
+      t= 4150ms  com.acme.queue   bg_step  @ libsystem -> Root @ MyApp
+    """
+    return """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <start-time id="T1">100000000</start-time>
+    <weight id="W" fmt="50.00 ms">50000000</weight>
+    <thread-state id="RUN" fmt="Running">Running</thread-state>
+    <thread id="MAIN" name="Main Thread"/>
+    <tagged-backtrace id="TB1">
+      <backtrace id="B1">
+        <frame id="WORK" name="Work.run" binary="MyApp" addr="0x100"/>
+        <frame id="ROOT" name="Root" binary="MyApp" addr="0x300"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <start-time id="T2">500000000</start-time>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <thread ref="MAIN"/>
+    <tagged-backtrace ref="TB1"/>
+  </row>
+  <row>
+    <start-time id="T3">4000000000</start-time>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <thread ref="MAIN"/>
+    <tagged-backtrace ref="TB1"/>
+  </row>
+  <row>
+    <start-time id="T4">4050000000</start-time>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <thread ref="MAIN"/>
+    <tagged-backtrace ref="TB1"/>
+  </row>
+  <row>
+    <start-time id="T5">4100000000</start-time>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <thread id="BG" name="com.acme.queue"/>
+    <tagged-backtrace id="TB2">
+      <backtrace id="B2">
+        <frame id="BGSTEP" name="bg_step" binary="libsystem" addr="0x500"/>
+        <frame ref="ROOT"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <start-time id="T6">4150000000</start-time>
+    <weight ref="W"/>
+    <thread-state ref="RUN"/>
+    <thread ref="BG"/>
+    <tagged-backtrace ref="TB2"/>
+  </row>
+</node>
+</trace-query-result>"""
+
+
+class TimeProfileScopeAndHangsTests(unittest.TestCase):
+    def test_scope_clips_samples_to_window(self) -> None:
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            start_ms=4000,
+            end_ms=4200,
+        )
+
+        self.assertIsNotNone(analysis.scope)
+        assert analysis.scope is not None
+        self.assertEqual(analysis.scope.start_ms, 4000)
+        self.assertEqual(analysis.scope.end_ms, 4200)
+        # 4 of the 6 samples are inside the [4000ms, 4200ms] window.
+        self.assertEqual(analysis.scope.samples_in_scope, 4)
+        # Total duration reflects only the scoped samples (4 × 50ms).
+        self.assertEqual(analysis.total_duration_ms, 200)
+
+    def test_scope_open_ended_extends_to_end(self) -> None:
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            start_ms=4000,
+            end_ms=None,
+        )
+
+        assert analysis.scope is not None
+        self.assertEqual(analysis.scope.end_ms, 0)  # 0 = open-ended marker
+        self.assertEqual(analysis.scope.samples_in_scope, 4)
+
+    def test_main_thread_stats_detects_large_gap_as_candidate_stall(self) -> None:
+        # Threshold 1000ms — only the 500ms→4000ms gap (~3500ms) qualifies as
+        # a candidate stall; the 100ms→500ms (400ms) and 4000ms→4050ms (50ms)
+        # gaps stay below it.
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            hang_threshold_ms=1000,
+        )
+
+        assert analysis.main_thread is not None
+        mt = analysis.main_thread
+        self.assertEqual(mt.samples, 4)  # 4 main-thread samples
+        self.assertGreaterEqual(mt.max_gap_ms, 3000)
+        self.assertEqual(mt.candidate_stalls, 1)
+        self.assertEqual(mt.gap_threshold_ms, 1000)
+
+    def test_main_thread_stats_threshold_filters_smaller_gaps(self) -> None:
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            hang_threshold_ms=5000,
+        )
+
+        assert analysis.main_thread is not None
+        self.assertEqual(analysis.main_thread.candidate_stalls, 0)
+
+    def test_user_methods_filter_by_binary(self) -> None:
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            user_binaries=("MyApp",),
+        )
+
+        user_symbols = {m.symbol for m in analysis.user_methods}
+        self.assertIn("Work.run", user_symbols)
+        # bg_step's binary is libsystem — should not appear in user methods.
+        self.assertNotIn("bg_step", user_symbols)
+        # `is_user` is still flagged on the merged list too.
+        my_app_methods = [m for m in analysis.hot_methods if m.binary == "MyApp"]
+        self.assertTrue(all(m.is_user for m in my_app_methods))
+
+    def test_format_surfaces_scope_main_thread_and_user_sections(self) -> None:
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            start_ms=4000,
+            end_ms=4200,
+            user_binaries=("MyApp",),
+        )
+
+        output = format_time_profiler(analysis, "com.example.app")
+
+        self.assertIn("**Scope:** 4000ms – 4200ms", output)
+        self.assertIn("Main Thread", output)
+        self.assertIn("Top User Methods", output)
+        self.assertIn("Hot Methods", output)  # original section still present
+
+    def test_legacy_fixture_without_new_columns_still_parses(self) -> None:
+        # The pre-existing minimal fixture has no start-time/thread/binary,
+        # but parse_time_profiler should still produce a usable report (no
+        # scope, no main_thread, no user methods).
+        analysis = parse_time_profiler(_time_profile_fixture())
+
+        self.assertIsNone(analysis.scope)
+        self.assertIsNone(analysis.main_thread)
+        self.assertEqual(analysis.user_methods, [])
+        self.assertGreater(analysis.total_duration_ms, 0)
 
 
 class RecordingTargetValidationTests(unittest.TestCase):
