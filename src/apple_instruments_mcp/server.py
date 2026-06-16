@@ -19,6 +19,7 @@ from apple_instruments_mcp.analysis import (
     compare_existing,
     compare_launch_analyses,
     compare_time_profile_analyses,
+    count_xctrace_listing_items,
     format_allocations,
     format_command,
     format_launch,
@@ -36,10 +37,15 @@ from apple_instruments_mcp.analysis import (
     parse_leaks,
     parse_network,
     parse_time_profiler,
+    probe_xctrace_health,
     run_analysis,
+    run_command,
 )
 from apple_instruments_mcp.analysis import (
     list_devices as xctrace_list_devices,
+)
+from apple_instruments_mcp.analysis import (
+    list_instruments as xctrace_list_instruments,
 )
 from apple_instruments_mcp.analysis import (
     list_templates as xctrace_list_templates,
@@ -262,6 +268,71 @@ async def run_profile(
             xpath=XPATH_NETWORK_CONNECTIONS,
         )
     return f"Unknown profile_type: {profile_type}"
+
+
+_DOCTOR_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+async def doctor_report() -> str:
+    """Implementation of the doctor MCP tool. Kept as a plain async function
+    so unit tests can call it directly without going through the FastMCP
+    decorator wrapper."""
+    facts: dict[str, str] = {}
+    problems: list[str] = []
+
+    try:
+        path = await run_command("xcrun", "--find", "xctrace", timeout=_DOCTOR_PROBE_TIMEOUT_SECONDS)
+        facts["xctrace_path"] = path.strip()
+    except Exception as exc:
+        problems.append(f"`xcrun --find xctrace` failed: {exc}")
+
+    try:
+        ver_output = await run_command("xcrun", "xctrace", "version", timeout=_DOCTOR_PROBE_TIMEOUT_SECONDS)
+        first_line = next((line.strip() for line in ver_output.splitlines() if line.strip()), "")
+        if first_line:
+            facts["xctrace_version"] = first_line
+    except Exception as exc:
+        problems.append(f"`xctrace version` failed: {exc}")
+
+    finding = await probe_xctrace_health()
+    if finding is not None:
+        marker = "blocker" if finding.severity == "blocker" else "warning"
+        problems.append(f"[{marker}] {finding.message}")
+        problems.extend(f"  - {hint}" for hint in finding.hints)
+
+    if finding is None or finding.severity != "blocker":
+        for label, fetch in (
+            ("devices", xctrace_list_devices),
+            ("templates", xctrace_list_templates),
+            ("instruments", xctrace_list_instruments),
+        ):
+            try:
+                output = await fetch()
+                facts[label] = str(count_xctrace_listing_items(output))
+            except Exception as exc:
+                problems.append(f"`xctrace list {label}` failed: {exc}")
+
+    ok = not problems
+    header = "# xctrace doctor — " + ("✅ ok" if ok else "🔴 problems")
+    lines = [header, ""]
+    if facts:
+        for key in ("xctrace_version", "xctrace_path", "devices", "templates", "instruments"):
+            if key in facts:
+                lines.append(f"- **{key}**: {facts[key]}")
+    if problems:
+        lines.extend(["", "## Problems"])
+        lines.extend(f"- {p}" for p in problems)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def doctor() -> str:
+    """One-shot health check: xctrace is responsive, what version, where on
+    disk, and how many devices/templates/instruments it can see. Useful as the
+    first call before recording so a wedged toolchain surfaces immediately
+    instead of being discovered through a failed record.
+    """
+    return await doctor_report()
 
 
 @mcp.tool()

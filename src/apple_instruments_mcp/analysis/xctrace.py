@@ -85,6 +85,27 @@ async def list_templates() -> str:
     return await run_command("xcrun", "xctrace", "list", "templates")
 
 
+async def list_instruments() -> str:
+    return await run_command("xcrun", "xctrace", "list", "instruments")
+
+
+def count_xctrace_listing_items(output: str) -> int:
+    """Count data lines in `xctrace list <thing>` output, skipping section
+    headers (`== Foo ==` or trailing-colon `Foo:` styles) and blank lines.
+    """
+    count = 0
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("==") and line.endswith("=="):
+            continue
+        if line.endswith(":"):
+            continue
+        count += 1
+    return count
+
+
 def parse_xctrace_listing(output: str) -> dict[str, list[dict[str, str]]]:
     sections: dict[str, list[dict[str, str]]] = {}
     current_section = "items"

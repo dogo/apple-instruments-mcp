@@ -1573,5 +1573,155 @@ class FormatTargetErrorRecordingWedgeTests(unittest.TestCase):
         self.assertIn("103 ms", output)
 
 
+class CountXctraceListingItemsTests(unittest.TestCase):
+    def test_counts_data_lines_only(self) -> None:
+        from apple_instruments_mcp.analysis.xctrace import count_xctrace_listing_items
+
+        output = """== Devices ==
+Diogo's iPhone (17.5) (DEAD-BEEF)
+iPhone 17 (CEC2F29A)
+
+== Devices Offline ==
+Old iPad
+"""
+        self.assertEqual(count_xctrace_listing_items(output), 3)
+
+    def test_skips_colon_section_headers(self) -> None:
+        from apple_instruments_mcp.analysis.xctrace import count_xctrace_listing_items
+
+        output = "Standard Templates:\nApp Launch\nTime Profiler\n\nCustom Templates:\n"
+        self.assertEqual(count_xctrace_listing_items(output), 2)
+
+    def test_empty_output_is_zero(self) -> None:
+        from apple_instruments_mcp.analysis.xctrace import count_xctrace_listing_items
+
+        self.assertEqual(count_xctrace_listing_items(""), 0)
+
+
+class DoctorToolTests(unittest.TestCase):
+    """Drive `server.doctor` with patched xctrace surface to verify reporting."""
+
+    def _run_doctor(
+        self,
+        *,
+        run_command_side_effect,
+        probe_finding,
+        list_devices_output: str = "== Devices ==\nA\nB\n",
+        list_templates_output: str = "== Templates ==\nTime Profiler\n",
+        list_instruments_output: str = "== Instruments ==\nCPU Profiler\nAllocations\n",
+        list_devices_error: Exception | None = None,
+        list_templates_error: Exception | None = None,
+        list_instruments_error: Exception | None = None,
+    ) -> str:
+        from apple_instruments_mcp import server
+
+        async def fake_devices():
+            if list_devices_error is not None:
+                raise list_devices_error
+            return list_devices_output
+
+        async def fake_templates():
+            if list_templates_error is not None:
+                raise list_templates_error
+            return list_templates_output
+
+        async def fake_instruments():
+            if list_instruments_error is not None:
+                raise list_instruments_error
+            return list_instruments_output
+
+        async def fake_probe():
+            return probe_finding
+
+        with (
+            mock.patch.object(server, "run_command", side_effect=run_command_side_effect),
+            mock.patch.object(server, "probe_xctrace_health", side_effect=fake_probe),
+            mock.patch.object(server, "xctrace_list_devices", side_effect=fake_devices),
+            mock.patch.object(server, "xctrace_list_templates", side_effect=fake_templates),
+            mock.patch.object(server, "xctrace_list_instruments", side_effect=fake_instruments),
+        ):
+            return asyncio.run(server.doctor_report())
+
+    def test_healthy_report_includes_version_path_and_counts(self) -> None:
+        async def fake_run(*args, **kwargs):  # noqa: ARG001
+            if "--find" in args:
+                return "/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace\n"
+            return "xctrace version 14.0\nIncludes …\n"
+
+        output = self._run_doctor(run_command_side_effect=fake_run, probe_finding=None)
+
+        self.assertIn("✅ ok", output)
+        self.assertIn("xctrace_version", output)
+        self.assertIn("xctrace version 14.0", output)
+        self.assertIn("/Applications/Xcode.app", output)
+        self.assertIn("- **devices**: 2", output)
+        self.assertIn("- **templates**: 1", output)
+        self.assertIn("- **instruments**: 2", output)
+        self.assertNotIn("## Problems", output)
+
+    def test_blocker_probe_surfaces_as_problem_and_skips_listings(self) -> None:
+        async def fake_run(*args, **kwargs):  # noqa: ARG001
+            if "--find" in args:
+                return "/usr/bin/xctrace\n"
+            return "xctrace version 14.0\n"
+
+        listings_called = {"devices": 0, "templates": 0, "instruments": 0}
+
+        async def counting_devices():
+            listings_called["devices"] += 1
+            return "== Devices ==\nA\n"
+
+        async def counting_templates():
+            listings_called["templates"] += 1
+            return "== Templates ==\nT\n"
+
+        async def counting_instruments():
+            listings_called["instruments"] += 1
+            return "== Instruments ==\nI\n"
+
+        from apple_instruments_mcp import server
+        from apple_instruments_mcp.analysis.xctrace import PreflightFinding
+
+        async def fake_probe():
+            return PreflightFinding(
+                "blocker",
+                "`xctrace list devices` did not respond within 5s.",
+                ("Try: `pkill -9 xctrace` then retry.",),
+            )
+
+        with (
+            mock.patch.object(server, "run_command", side_effect=fake_run),
+            mock.patch.object(server, "probe_xctrace_health", side_effect=fake_probe),
+            mock.patch.object(server, "xctrace_list_devices", side_effect=counting_devices),
+            mock.patch.object(server, "xctrace_list_templates", side_effect=counting_templates),
+            mock.patch.object(server, "xctrace_list_instruments", side_effect=counting_instruments),
+        ):
+            output = asyncio.run(server.doctor_report())
+
+        self.assertIn("🔴 problems", output)
+        self.assertIn("[blocker]", output)
+        self.assertIn("did not respond", output)
+        self.assertIn("pkill -9 xctrace", output)
+        # A blocker probe is a hard stop — listings must not be queried.
+        self.assertEqual(listings_called, {"devices": 0, "templates": 0, "instruments": 0})
+
+    def test_partial_failure_still_reports_what_worked(self) -> None:
+        async def fake_run(*args, **kwargs):  # noqa: ARG001
+            if "--find" in args:
+                return "/usr/bin/xctrace\n"
+            return "xctrace version 14.0\n"
+
+        output = self._run_doctor(
+            run_command_side_effect=fake_run,
+            probe_finding=None,
+            list_instruments_error=RuntimeError("xctrace list instruments crashed"),
+        )
+
+        self.assertIn("🔴 problems", output)  # the instruments failure
+        self.assertIn("- **devices**: 2", output)  # devices still counted
+        self.assertIn("- **templates**: 1", output)  # templates still counted
+        self.assertIn("`xctrace list instruments` failed", output)
+
+
 if __name__ == "__main__":
     unittest.main()
