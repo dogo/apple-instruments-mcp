@@ -201,6 +201,7 @@ class AnalysisTests(unittest.TestCase):
                 "10s",
                 "--output",
                 "/tmp/trace.trace",
+                "--no-prompt",
                 "--attach",
                 "MyMacApp",
             ],
@@ -1273,9 +1274,10 @@ class FormatTargetErrorRecordingWedgeTests(unittest.TestCase):
         )
 
         self.assertIn("announced `Starting recording`", output)
+        self.assertIn("per-instrument tap", output)
+        self.assertIn("DTServiceHub/dtsecurity", output)
         self.assertIn("runtime wedge", output)
         self.assertIn("simctl shutdown SIM-123", output)
-        self.assertIn("DTServiceHub", output)
 
     def test_never_started_message_suggests_pkill_xctrace(self) -> None:
         target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")

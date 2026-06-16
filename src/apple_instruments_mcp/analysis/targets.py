@@ -155,17 +155,19 @@ def format_target_error(
 
     if started_but_unfinished:
         lines.append(
-            "xctrace announced `Starting recording` but never finished within the time limit."
+            "xctrace launched the target and announced `Starting recording`, but the "
+            "per-instrument tap on the simulator never came up — DTServiceHub/dtsecurity "
+            "completed the launch handshake but stalled before streaming any data."
         )
         lines.extend(_format_preflight_timings(preflight_timings))
         if target.bundle_id and target.device_id:
             lines.extend(
                 [
                     "- This is a runtime wedge AFTER the simulator accepted the launch — preflight passed.",
-                    "- The Instruments daemon (or DTServiceHub on the simulator) is the likely culprit.",
+                    "- The stall is in the Instruments daemon path on the simulator (DTServiceHub or dtsecurity), not in xctrace or the app.",
                     f"- Reboot the simulator: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
                     "- If reboot doesn't help: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
-                    "- As a last resort, open Instruments.app once to reset the tracing layer.",
+                    "- Last resort: open Instruments.app once to reset the tracing layer.",
                 ]
             )
         else:

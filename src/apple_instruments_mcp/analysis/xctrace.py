@@ -128,6 +128,7 @@ def build_record_command(
         f"{time_limit_seconds}s",
         "--output",
         str(output_path),
+        "--no-prompt",
     ]
     args.extend(target.xctrace_args())
     return args
