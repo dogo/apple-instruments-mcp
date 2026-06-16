@@ -12,9 +12,13 @@ from apple_instruments_mcp.analysis.targets import RecordingTarget
 
 PREFLIGHT_TIMEOUT_SECONDS = 5.0
 RECORD_STARTUP_TIMEOUT_SECONDS = 15.0
-RECORD_TEARDOWN_GRACE_SECONDS = 15.0
+RECORD_TEARDOWN_GRACE_SECONDS = 60.0
 RECORD_POLL_INTERVAL_SECONDS = 0.5
 RECORD_STARTED_MARKER = "starting recording"
+_WEDGE_ERROR_MARKERS = (
+    "started recording but did not finish",
+    "did not begin recording within",
+)
 
 
 async def run_command(*args: str, timeout: float | None = None) -> str:
@@ -138,6 +142,27 @@ def format_command(args: list[str]) -> str:
     return shlex.join(args)
 
 
+def _is_wedge_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _WEDGE_ERROR_MARKERS)
+
+
+def _trace_bundle_finalized(trace_path: Path) -> bool:
+    """A `.trace` bundle is finalized when its `Trace*.run/` holds artifacts
+    other than the boilerplate `RunIssues.storedata`. Empty or RunIssues-only
+    bundles are the signature of a wedged or aborted recording.
+    """
+    if not trace_path.is_dir():
+        return False
+    for run_dir in trace_path.glob("Trace*.run"):
+        if not run_dir.is_dir():
+            continue
+        for entry in run_dir.iterdir():
+            if entry.name != "RunIssues.storedata":
+                return True
+    return False
+
+
 async def record_trace(
     template: str,
     target: RecordingTarget,
@@ -148,7 +173,13 @@ async def record_trace(
     await kill_stale_xctrace_processes()
     try:
         await _run_record_with_watchdog(args, time_limit_seconds)
-    except RuntimeError:
+    except RuntimeError as exc:
+        # xctrace can exit non-zero with a perfectly valid trace bundle — e.g. a
+        # `--launch` target killed at --time-limit returns its own exit status
+        # while the recording finishes normally on disk. Trust the bundle as
+        # ground truth, unless the failure is a wedge (no usable bundle then).
+        if not _is_wedge_error(str(exc)) and _trace_bundle_finalized(output_path):
+            return
         await kill_stale_xctrace_processes()
         raise
 

@@ -29,6 +29,7 @@ from apple_instruments_mcp.analysis import (
 from apple_instruments_mcp.analysis import xctrace as xctrace_module
 from apple_instruments_mcp.analysis.xctrace import (
     PreflightFinding,
+    _trace_bundle_finalized,
     _watchdog_loop,
     find_stale_xctrace_pids,
     format_preflight_findings,
@@ -1066,6 +1067,46 @@ class StaleXctraceProcessCleanupTests(unittest.TestCase):
         self.assertEqual(calls[1], ("kill", "-9", "111", "222"))
 
 
+def _seed_finalized_trace(trace_path: Path) -> None:
+    """Build a fake `.trace` bundle that looks finalized to `_trace_bundle_finalized`."""
+    run_dir = trace_path / "Trace1.run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "RunIssues.storedata").write_bytes(b"")
+    (run_dir / "core.perfdata").write_bytes(b"x" * 128)
+
+
+def _seed_wedged_trace(trace_path: Path) -> None:
+    """Build a `.trace` bundle in the shape xctrace leaves behind on a wedge:
+    only Trace1.run/RunIssues.storedata, no payload."""
+    run_dir = trace_path / "Trace1.run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "RunIssues.storedata").write_bytes(b"")
+
+
+class TraceBundleFinalizedTests(unittest.TestCase):
+    def test_missing_path_is_not_finalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(_trace_bundle_finalized(Path(tmp) / "missing.trace"))
+
+    def test_bundle_with_only_run_issues_is_not_finalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "wedged.trace"
+            _seed_wedged_trace(trace)
+            self.assertFalse(_trace_bundle_finalized(trace))
+
+    def test_bundle_with_payload_is_finalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "ok.trace"
+            _seed_finalized_trace(trace)
+            self.assertTrue(_trace_bundle_finalized(trace))
+
+    def test_bundle_without_any_run_dir_is_not_finalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "empty.trace"
+            trace.mkdir()
+            self.assertFalse(_trace_bundle_finalized(trace))
+
+
 class RecordTraceCleanupTests(unittest.TestCase):
     def test_record_trace_sweeps_before_and_after_on_failure(self) -> None:
         sweep_calls: list[str] = []
@@ -1092,6 +1133,58 @@ class RecordTraceCleanupTests(unittest.TestCase):
 
         self.assertTrue(record_called)
         self.assertEqual(sweep_calls, ["sweep", "sweep"])
+
+    def test_record_trace_swallows_nonzero_exit_when_bundle_is_finalized(self) -> None:
+        sweep_calls: list[str] = []
+
+        async def fake_kill():
+            sweep_calls.append("sweep")
+            return 0
+
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        with (
+            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            trace_path = Path(tmp) / "t.trace"
+            _seed_finalized_trace(trace_path)
+
+            async def fake_record(*args, **kwargs):  # noqa: ARG001
+                # xctrace exited non-zero (e.g. the launched target was killed
+                # by --time-limit and returned its own exit status), but the
+                # bundle on disk is fine.
+                raise RuntimeError("xctrace exited with status 54")
+
+            with mock.patch.object(
+                xctrace_module, "_run_record_with_watchdog", side_effect=fake_record
+            ):
+                asyncio.run(xctrace_module.record_trace("App Launch", target, 10, trace_path))
+
+        self.assertEqual(sweep_calls, ["sweep"])  # no post-failure sweep — treated as success
+
+    def test_record_trace_propagates_wedge_even_if_bundle_exists(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
+
+        async def fake_kill():
+            return 0
+
+        async def fake_record(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError(
+                "xctrace started recording but did not finish within 5s + 60s grace."
+            )
+
+        with (
+            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
+            mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            trace_path = Path(tmp) / "t.trace"
+            # Even with a "finalized-looking" bundle, a wedge error must still
+            # propagate — the bundle from a wedged sim isn't trustworthy.
+            _seed_finalized_trace(trace_path)
+            with self.assertRaises(RuntimeError):
+                asyncio.run(xctrace_module.record_trace("App Launch", target, 5, trace_path))
 
     def test_record_trace_sweeps_only_before_on_success(self) -> None:
         sweep_calls: list[str] = []
