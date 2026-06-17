@@ -37,9 +37,11 @@ from apple_instruments_mcp.analysis import (
     parse_leaks,
     parse_network,
     parse_time_profiler,
+    preset_names,
     probe_xctrace_health,
     run_analysis,
     run_command,
+    run_preset_analysis,
 )
 from apple_instruments_mcp.analysis import (
     list_devices as xctrace_list_devices,
@@ -333,6 +335,55 @@ async def doctor() -> str:
     instead of being discovered through a failed record.
     """
     return await doctor_report()
+
+
+_PRESET_DESCRIPTION = (
+    "Profile a target with a bundle of instruments in a single recording, "
+    "then report each family that produced data. Presets: "
+    + " / ".join(preset_names())
+    + ". `cpu` = Time Profiler. `memory` = Allocations + Leaks. "
+    "`network` = Network Connections. `full` = all of the above. "
+    "Faster than three separate runs when you want a broad picture."
+)
+
+PresetName = Annotated[
+    Literal["cpu", "memory", "network", "full"],
+    Field(description="Preset bundle of instruments to record in a single trace."),
+]
+
+
+@mcp.tool(description=_PRESET_DESCRIPTION)
+async def profile_preset(
+    preset: PresetName,
+    bundle_id: BundleId = None,
+    device_id: DeviceId = None,
+    launch_path: LaunchPath = None,
+    launch_args: LaunchArgs = None,
+    process_name: ProcessName = None,
+    pid: Pid = None,
+    all_processes: AllProcesses = False,
+    time_limit_seconds: TimeLimitSeconds = 20,
+    dry_run: DryRun = False,
+    keep_trace: KeepTrace = False,
+    output_dir: OutputDir = None,
+) -> str:
+    target = make_target(
+        bundle_id=bundle_id,
+        device_id=device_id,
+        launch_path=launch_path,
+        launch_args=launch_args,
+        process_name=process_name,
+        pid=pid,
+        all_processes=all_processes,
+    )
+    return await run_preset_analysis(
+        preset,
+        target,
+        time_limit_seconds,
+        dry_run=dry_run,
+        keep_trace=keep_trace,
+        output_dir=output_dir,
+    )
 
 
 @mcp.tool()

@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import TypeVar
 
 from apple_instruments_mcp.analysis.models import AnalysisQuality
+from apple_instruments_mcp.analysis.presets import (
+    Family,
+    preset_families,
+    preset_instruments,
+)
 from apple_instruments_mcp.analysis.quality import assess_xml_quality, format_quality
 from apple_instruments_mcp.analysis.targets import RecordingTarget, format_target_error
 from apple_instruments_mcp.analysis.xctrace import (
@@ -150,6 +155,148 @@ async def run_analysis(
         return format_target_error(
             target,
             template,
+            str(error),
+            partial_trace=partial_trace,
+            preflight_timings=preflight_timings,
+        )
+    finally:
+        if not keep_trace and not record_failed:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+async def _run_family(
+    family: Family, trace_path: Path, xml_path: Path, target_label: str
+) -> str | None:
+    """Export and analyze one family from a finished trace bundle.
+
+    Returns the formatted family section, or `None` when the family produced
+    no evidence (its instrument was in the recording but emitted nothing
+    parseable — typically the case when the workload didn't exercise it). On
+    export failure the caller decides what to surface.
+    """
+    try:
+        await export_xml(trace_path, xml_path, xpath=family.xpath)
+    except Exception as exc:
+        return (
+            f"## {family.section_title}\n"
+            f"- xctrace export failed: {exc}"
+        )
+    xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
+    if not family.evidence_checker(xml_content):
+        return None
+    analysis = family.parser(xml_content)
+    body = family.formatter(analysis, target_label)
+    quality = assess_xml_quality(
+        xml_content, family.evidence_checker(xml_content), family.parser_name
+    )
+    quality_text = format_quality(quality)
+    section = f"## {family.section_title}\n\n{body}"
+    if quality_text:
+        section = f"{section}\n{quality_text}"
+    return section
+
+
+async def run_preset_analysis(
+    preset: str,
+    target: RecordingTarget,
+    time_limit_seconds: int,
+    *,
+    dry_run: bool = False,
+    keep_trace: bool = False,
+    output_dir: str | None = None,
+) -> str:
+    """Record once with all instruments needed by `preset`, then run every
+    family in the preset against the resulting trace bundle. Each family that
+    produced evidence becomes its own section in the report; missing families
+    are dropped so the LLM doesn't have to interpret "no data" sections.
+    """
+    instruments = preset_instruments(preset)
+    families = preset_families(preset)
+    preset_label = f"{preset} ({', '.join(instruments)})"
+
+    base_dir = Path(os.path.expanduser(output_dir)) if output_dir else None
+    if dry_run:
+        trace_path = (base_dir / "trace.trace") if base_dir else Path("<temporary-directory>") / "trace.trace"
+        command = format_command(
+            build_record_command(
+                None, target, time_limit_seconds, trace_path, instruments=instruments
+            )
+        )
+        return "\n".join(
+            [
+                "# xctrace Dry Run",
+                "",
+                f"**Preset:** {preset_label}",
+                f"**Target:** {target.label}",
+                f"**Output:** {trace_path}",
+                "",
+                "```bash",
+                command,
+                "```",
+            ]
+        )
+
+    validation_errors = target.validate()
+    if validation_errors:
+        return "\n".join(
+            [
+                f"Refusing to record preset '{preset}': target failed pre-flight checks.",
+                "",
+                *(f"- {error}" for error in validation_errors),
+            ]
+        )
+
+    preflight_timings: dict[str, float] | None = None
+    if target.device_id and target.bundle_id:
+        report = await preflight_ios_target(target.device_id, target.bundle_id)
+        preflight_timings = report.timings
+        if report.blockers:
+            return format_preflight_findings(preset_label, target.label, report.blockers)
+
+    if base_dir:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
+    trace_path = tmp_dir / "trace.trace"
+    record_failed = False
+
+    try:
+        await record_trace(
+            None, target, time_limit_seconds, trace_path, instruments=instruments
+        )
+
+        sections: list[str] = [f"# {preset.capitalize()} Profile — {target.label}", ""]
+        sections.append(f"**Instruments recorded:** {', '.join(instruments)}")
+        missing: list[str] = []
+        for family in families:
+            xml_path = tmp_dir / f"export-{family.key}.xml"
+            section = await _run_family(family, trace_path, xml_path, target.label)
+            if section is None:
+                missing.append(family.section_title)
+                continue
+            sections.append("")
+            sections.append(section)
+        if missing:
+            sections.append("")
+            sections.append("## Notes")
+            sections.extend(
+                f"- No `{title}` data in the trace — workload may not have exercised it."
+                for title in missing
+            )
+        if keep_trace:
+            sections.extend(
+                [
+                    "",
+                    "## Artifacts",
+                    f"- Trace: `{trace_path}`",
+                ]
+            )
+        return "\n".join(sections)
+    except Exception as error:
+        record_failed = True
+        partial_trace = trace_path if trace_path.exists() else None
+        return format_target_error(
+            target,
+            preset_label,
             str(error),
             partial_trace=partial_trace,
             preflight_timings=preflight_timings,

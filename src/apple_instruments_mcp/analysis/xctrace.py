@@ -5,6 +5,7 @@ import contextlib
 import json
 import re
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,23 +139,40 @@ def list_as_json(output: str) -> str:
 
 
 def build_record_command(
-    template: str,
+    template: str | None,
     target: RecordingTarget,
     time_limit_seconds: int,
     output_path: Path,
+    *,
+    instruments: Sequence[str] = (),
 ) -> list[str]:
+    """Build the `xcrun xctrace record` argv.
+
+    Exactly one of `template` and `instruments` must be supplied — `template`
+    is a `.tracetemplate` name (e.g. "Time Profiler", "App Launch"), and
+    `instruments` is a list of individual instrument names passed via
+    repeated `--instrument` flags (e.g. ["Time Profiler", "Allocations"]).
+    """
+    has_instruments = bool(instruments)
+    if (template is None) == (not has_instruments):
+        raise ValueError(
+            "build_record_command requires exactly one of template or instruments."
+        )
     args = [
         "xcrun",
         "xctrace",
         "record",
-        "--template",
-        template,
         "--time-limit",
         f"{time_limit_seconds}s",
         "--output",
         str(output_path),
         "--no-prompt",
     ]
+    if template is not None:
+        args.extend(["--template", template])
+    else:
+        for instrument in instruments:
+            args.extend(["--instrument", instrument])
     args.extend(target.xctrace_args())
     return args
 
@@ -185,12 +203,16 @@ def _trace_bundle_finalized(trace_path: Path) -> bool:
 
 
 async def record_trace(
-    template: str,
+    template: str | None,
     target: RecordingTarget,
     time_limit_seconds: int,
     output_path: Path,
+    *,
+    instruments: Sequence[str] = (),
 ) -> None:
-    args = build_record_command(template, target, time_limit_seconds, output_path)
+    args = build_record_command(
+        template, target, time_limit_seconds, output_path, instruments=instruments
+    )
     await kill_stale_xctrace_processes()
     try:
         await _run_record_with_watchdog(args, time_limit_seconds)

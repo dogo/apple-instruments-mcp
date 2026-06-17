@@ -197,13 +197,13 @@ class AnalysisTests(unittest.TestCase):
                 "xcrun",
                 "xctrace",
                 "record",
-                "--template",
-                "Time Profiler",
                 "--time-limit",
                 "10s",
                 "--output",
                 "/tmp/trace.trace",
                 "--no-prompt",
+                "--template",
+                "Time Profiler",
                 "--attach",
                 "MyMacApp",
             ],
@@ -1721,6 +1721,206 @@ class DoctorToolTests(unittest.TestCase):
         self.assertIn("- **devices**: 2", output)  # devices still counted
         self.assertIn("- **templates**: 1", output)  # templates still counted
         self.assertIn("`xctrace list instruments` failed", output)
+
+
+class PresetsRegistryTests(unittest.TestCase):
+    def test_preset_names_are_stable(self) -> None:
+        from apple_instruments_mcp.analysis.presets import preset_names
+
+        self.assertEqual(preset_names(), ["cpu", "memory", "network", "full"])
+
+    def test_preset_instruments_for_cpu(self) -> None:
+        from apple_instruments_mcp.analysis.presets import preset_instruments
+
+        self.assertEqual(preset_instruments("cpu"), ["Time Profiler"])
+
+    def test_preset_instruments_for_memory_lists_both(self) -> None:
+        from apple_instruments_mcp.analysis.presets import preset_instruments
+
+        self.assertEqual(preset_instruments("memory"), ["Allocations", "Leaks"])
+
+    def test_preset_instruments_for_full_dedupes(self) -> None:
+        from apple_instruments_mcp.analysis.presets import preset_instruments
+
+        # `full` lists cpu, allocations, leaks, network; no instrument is shared
+        # between them, but the de-dup path is exercised here.
+        result = preset_instruments("full")
+        self.assertEqual(len(result), len(set(result)))
+        self.assertIn("Time Profiler", result)
+        self.assertIn("Allocations", result)
+        self.assertIn("Leaks", result)
+        self.assertIn("Network Connections", result)
+
+    def test_unknown_preset_raises(self) -> None:
+        from apple_instruments_mcp.analysis.presets import preset_families
+
+        with self.assertRaises(ValueError) as ctx:
+            preset_families("ultraviolet")
+        self.assertIn("unknown preset", str(ctx.exception))
+        self.assertIn("cpu", str(ctx.exception))
+
+
+class BuilderInstrumentsTests(unittest.TestCase):
+    def test_builder_emits_repeated_instrument_flags(self) -> None:
+        target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-1")
+        argv = build_record_command(
+            None,
+            target,
+            5,
+            Path("/tmp/x.trace"),
+            instruments=("Time Profiler", "Allocations"),
+        )
+
+        self.assertNotIn("--template", argv)
+        # Order preserved, each value follows its --instrument
+        idxs = [i for i, a in enumerate(argv) if a == "--instrument"]
+        self.assertEqual(len(idxs), 2)
+        self.assertEqual(argv[idxs[0] + 1], "Time Profiler")
+        self.assertEqual(argv[idxs[1] + 1], "Allocations")
+        # The launch target is still last (--launch -- bundle.id)
+        self.assertEqual(argv[-3:], ["--launch", "--", "com.example.app"])
+
+    def test_builder_rejects_both_template_and_instruments(self) -> None:
+        target = RecordingTarget.build(process_name="App")
+        with self.assertRaises(ValueError):
+            build_record_command(
+                "Time Profiler",
+                target,
+                5,
+                Path("/tmp/x.trace"),
+                instruments=("Allocations",),
+            )
+
+    def test_builder_rejects_neither_template_nor_instruments(self) -> None:
+        target = RecordingTarget.build(process_name="App")
+        with self.assertRaises(ValueError):
+            build_record_command(None, target, 5, Path("/tmp/x.trace"))
+
+
+class RunPresetAnalysisTests(unittest.TestCase):
+    """Mock record + export to verify run_preset_analysis composes a
+    multi-section report from the trace bundle's families."""
+
+    def _run_with_mocks(
+        self,
+        *,
+        preset: str,
+        export_xml_payloads: dict[str, str],
+        record_side_effect=None,
+        keep_trace: bool = False,
+    ):
+        from apple_instruments_mcp.analysis import orchestrator as orch_module
+
+        recorded: dict[str, object] = {"instruments": None, "template": None}
+
+        async def fake_record(template, target, time_limit_seconds, output_path, *, instruments=()):  # noqa: ARG001
+            recorded["template"] = template
+            recorded["instruments"] = list(instruments)
+            # Simulate that xctrace wrote a trace bundle.
+            output_path.mkdir(parents=True, exist_ok=True)
+            run_dir = output_path / "Trace1.run"
+            run_dir.mkdir()
+            (run_dir / "core.perfdata").write_bytes(b"x")
+            if record_side_effect is not None:
+                await record_side_effect()
+
+        async def fake_export(trace_path, output_xml_path, *, xpath=None, toc=False):  # noqa: ARG001
+            assert xpath is not None
+            payload = export_xml_payloads.get(xpath, "")
+            output_xml_path.write_text(payload, encoding="utf-8")
+
+        target = RecordingTarget.build(process_name="MyApp")
+        with (
+            mock.patch.object(orch_module, "record_trace", side_effect=fake_record),
+            mock.patch.object(orch_module, "export_xml", side_effect=fake_export),
+        ):
+            output = asyncio.run(
+                orch_module.run_preset_analysis(
+                    preset, target, 5, keep_trace=keep_trace
+                )
+            )
+        return output, recorded
+
+    def test_dry_run_lists_instruments_without_recording(self) -> None:
+        from apple_instruments_mcp.analysis.orchestrator import run_preset_analysis
+
+        target = RecordingTarget.build(process_name="MyApp")
+        output = asyncio.run(
+            run_preset_analysis("memory", target, 5, dry_run=True)
+        )
+        self.assertIn("xctrace Dry Run", output)
+        self.assertIn("memory", output)
+        self.assertIn("--instrument", output)
+        self.assertIn("Allocations", output)
+        self.assertIn("Leaks", output)
+
+    def test_records_with_preset_instruments_and_renders_present_families(self) -> None:
+        from apple_instruments_mcp.analysis.presets import FAMILY_ALLOCATIONS, FAMILY_LEAKS
+
+        # Allocations has evidence; Leaks has none (empty XML).
+        export_payloads = {
+            FAMILY_ALLOCATIONS.xpath: _allocations_evidence_xml(),
+            FAMILY_LEAKS.xpath: "",
+        }
+        output, recorded = self._run_with_mocks(
+            preset="memory", export_xml_payloads=export_payloads
+        )
+
+        self.assertEqual(recorded["template"], None)
+        self.assertEqual(recorded["instruments"], ["Allocations", "Leaks"])
+        self.assertIn("## Allocations", output)
+        self.assertNotIn("## Leaks\n\n#", output)  # no Leaks body section
+        # The missing family is summarized in the Notes section.
+        self.assertIn("Leaks", output)
+        self.assertIn("Notes", output)
+        self.assertIn("workload may not have exercised it", output)
+
+    def test_export_failure_in_one_family_does_not_nuke_the_rest(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator as orch_module
+        from apple_instruments_mcp.analysis.presets import FAMILY_LEAKS
+
+        target = RecordingTarget.build(process_name="MyApp")
+
+        async def fake_record(template, target, time_limit_seconds, output_path, *, instruments=()):  # noqa: ARG001
+            output_path.mkdir(parents=True, exist_ok=True)
+            run_dir = output_path / "Trace1.run"
+            run_dir.mkdir()
+            (run_dir / "core.perfdata").write_bytes(b"x")
+
+        async def fake_export(trace_path, output_xml_path, *, xpath=None, toc=False):  # noqa: ARG001
+            if xpath == FAMILY_LEAKS.xpath:
+                raise RuntimeError("export blew up for Leaks")
+            output_xml_path.write_text(_allocations_evidence_xml(), encoding="utf-8")
+
+        with (
+            mock.patch.object(orch_module, "record_trace", side_effect=fake_record),
+            mock.patch.object(orch_module, "export_xml", side_effect=fake_export),
+        ):
+            output = asyncio.run(
+                orch_module.run_preset_analysis("memory", target, 5)
+            )
+
+        self.assertIn("## Allocations", output)
+        self.assertIn("## Leaks", output)
+        self.assertIn("xctrace export failed: export blew up for Leaks", output)
+
+
+def _allocations_evidence_xml() -> str:
+    # `has_allocations_evidence` keys on either a <live-bytes>/<total-bytes>/<peak*>
+    # element or a row carrying `persistent-bytes|total-bytes|category` as attributes.
+    return """<?xml version="1.0"?>
+<trace-query-result>
+  <node>
+    <schema name="allocation-statistics"/>
+    <row>
+      <category>String</category>
+      <total-bytes fmt="1.2 KB">1200</total-bytes>
+      <live-bytes fmt="500 B">500</live-bytes>
+      <count-allocated>10</count-allocated>
+      <count-live>3</count-live>
+    </row>
+  </node>
+</trace-query-result>"""
 
 
 if __name__ == "__main__":

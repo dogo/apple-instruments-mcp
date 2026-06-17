@@ -56,7 +56,14 @@ from apple_instruments_mcp.analysis.orchestrator import (
     analyze_existing,
     compare_existing,
     run_analysis,
+    run_preset_analysis,
     unsupported_template_report,
+)
+from apple_instruments_mcp.analysis.presets import (
+    PRESETS,
+    preset_families,
+    preset_instruments,
+    preset_names,
 )
 from apple_instruments_mcp.analysis.quality import assess_xml_quality, format_quality
 from apple_instruments_mcp.analysis.severity import (
@@ -159,7 +166,12 @@ __all__ = [
     "parse_xctrace_listing",
     "probe_xctrace_health",
     "record_trace",
+    "PRESETS",
+    "preset_families",
+    "preset_instruments",
+    "preset_names",
     "run_analysis",
+    "run_preset_analysis",
     "run_command",
     "unsupported_template_report",
 ]
