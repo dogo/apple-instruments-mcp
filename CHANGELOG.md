@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 - 2026-06-17
+
+- Added two new MCP tools: `doctor` (one-shot xctrace health check with xctrace version/path and device/template/instrument counts) and `profile_preset` (`cpu`/`memory`/`network`/`full` bundles that record multiple instruments in a single trace and report each family that produced data).
+- Added dSYM symbolication to the time-profile tools. Pass `dsym_path` on `analyze_time_profiler` / `analyze_time_profiler_trace` to resolve raw-address frames from release builds; UUID is verified via `dwarfdump` before `atos` runs and atos line-count mismatches drop the batch entirely, so symbol names are never invented.
+- Added scope/hang/user-method views to time profiler analysis. `scope_start_ms` and `scope_end_ms` clip samples to a window; `hang_threshold_ms` (default 250) surfaces main-thread inter-sample gaps as candidate stalls in a new "Main Thread" section; `user_binaries` filters a "Top User Methods" view so system frames don't crowd out app code.
+- Replaced the `--time-limit + 30s` wrapper timeout on xctrace record with a streaming watchdog: 15s startup deadline + 60s teardown grace, with distinct diagnostics per phase and the last xctrace stdout line preserved so post-launch tap wedges (DTServiceHub/dtsecurity stalling after the simulator accepts the launch) are diagnosable from the response alone.
+- Trust the saved `.trace` bundle as ground truth when xctrace exits non-zero with a finalized bundle (e.g. a `--launch` target killed by `--time-limit` returning its own exit status). A bundle is considered finalized when `Trace*.run/` holds anything beyond the boilerplate `RunIssues.storedata`.
+- Pass `--no-prompt` on every record so xctrace doesn't hang on privacy prompts in non-interactive use; surface per-probe iOS preflight wall-clock timings in the failure diagnostic so it's obvious which probes passed before a post-launch wedge.
+
 ## 1.0.4 - 2026-06-15
 
 - Replaced the blunt `time_limit + 30s` wall timeout on `xctrace record` with a streaming watchdog that bails out within `time_limit + 15s` grace when xctrace announces `Starting recording` but never finishes — the post-launch runtime wedge case where the 1.0.3 pre-flight already passed.
