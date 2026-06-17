@@ -89,9 +89,12 @@ Other clients (Codex CLI, Kiro, Cursor, Cline, Continue, Windsurf, Zed) accept t
 ## Example Prompts
 
 ```text
+Run the xctrace doctor and tell me if recording is currently possible.
 List the devices and Instruments templates available on this Mac.
+Profile com.example.app on this simulator with the full preset for 15 seconds.
 Record an App Launch trace for com.example.app on this iPhone simulator and show the startup offenders.
 Launch /Applications/MyMacApp.app with Time Profiler and show CPU hot methods.
+Time-profile com.example.app, then zoom into the 8000ms–12000ms window and flag main-thread stalls above 200ms.
 Attach Allocations to the running process named MyMacApp for 30 seconds.
 Attach Time Profiler to PID 1234.
 Record all processes with Time Profiler for 10 seconds.
@@ -104,10 +107,12 @@ Compare ~/Desktop/baseline.trace and ~/Desktop/candidate.trace for launch regres
 
 | Tool | Instruments template | Description |
 | --- | --- | --- |
+| `doctor` | - | One-shot health check: xctrace version/path, device/template/instrument counts, and a problems section when probes or listings fail. Run this first if anything looks wedged. |
 | `list_devices` | - | Lists devices, simulators, runtimes, and host targets visible to `xctrace`. |
 | `list_devices_structured` | - | Returns the device/runtime listing as JSON. |
 | `list_templates` | - | Lists Instruments templates installed on this Mac. |
 | `list_templates_structured` | - | Returns the template listing as JSON. |
+| `profile_preset` | `cpu` / `memory` / `network` / `full` | Records a bundle of instruments in one trace, then reports each family that produced data. `full` covers CPU + Allocations + Leaks + Network in a single run. |
 | `profile_ios_app` | Selected by `profile_type` | Profiles an iOS, iPadOS, tvOS, watchOS, or visionOS app by bundle ID on a simulator/device. |
 | `profile_mac_app` | Selected by `profile_type` | Profiles a macOS `.app` or executable by launch path. |
 | `profile_process` | Selected by `profile_type` | Profiles a running process by process name or PID. |
