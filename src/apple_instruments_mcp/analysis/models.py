@@ -18,8 +18,20 @@ class CallTreeFrame:
 
 @dataclass(frozen=True)
 class SampleFrame:
+    """One frame inside a Time Profiler sample.
+
+    `addr`, `binary_uuid`, `binary_load_addr`, `arch` are populated when the
+    xctrace export carried them and are used by `symbolicate` to attempt
+    name resolution against a dSYM. Empty strings mean "not available" and
+    cause the symbolicator to leave the frame as-is.
+    """
+
     symbol: str
     binary: str = ""
+    addr: str = ""
+    binary_uuid: str = ""
+    binary_load_addr: str = ""
+    arch: str = ""
 
 
 @dataclass(frozen=True)

@@ -1923,5 +1923,207 @@ def _allocations_evidence_xml() -> str:
 </trace-query-result>"""
 
 
+class SymbolicateIsUnsymbolicatedTests(unittest.TestCase):
+    def test_hex_address_detected(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import is_unsymbolicated
+
+        self.assertTrue(is_unsymbolicated("0x100001a2b4"))
+        self.assertTrue(is_unsymbolicated("0xDEADBEEF"))
+
+    def test_real_symbol_is_not_flagged(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import is_unsymbolicated
+
+        self.assertFalse(is_unsymbolicated("MyApp.run()"))
+        self.assertFalse(is_unsymbolicated("-[NSString length]"))
+        self.assertFalse(is_unsymbolicated(""))
+        self.assertFalse(is_unsymbolicated("0xnotanaddress"))
+
+
+class SymbolicateAtosParsingTests(unittest.TestCase):
+    def test_parse_atos_line_strips_in_image_suffix(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import _parse_atos_line
+
+        line = "MyApp.run() (in MyApp) (MyApp.swift:42)"
+        self.assertEqual(_parse_atos_line(line), "MyApp.run()")
+
+    def test_parse_atos_line_keeps_raw_address_when_unresolved(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import _parse_atos_line
+
+        self.assertEqual(_parse_atos_line("0x100001a2b4"), "0x100001a2b4")
+
+
+class SymbolicateAtosResolveTests(unittest.TestCase):
+    def test_returns_addr_to_name_map_when_lines_align(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import atos_resolve
+
+        async def fake_run(*args, timeout):  # noqa: ARG001
+            return 0, "Func.one() (in MyApp) (a.swift:1)\nFunc.two() (in MyApp) (b.swift:2)\n"
+
+        with mock.patch(
+            "apple_instruments_mcp.analysis.symbolicate._run_capturing", side_effect=fake_run
+        ):
+            result = asyncio.run(
+                atos_resolve(Path("/d"), "arm64", "0x100000000", ["0x10001", "0x10002"])
+            )
+        self.assertEqual(result, {"0x10001": "Func.one()", "0x10002": "Func.two()"})
+
+    def test_drops_batch_when_line_count_mismatches(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import atos_resolve
+
+        # Two input addresses but atos returned only one line — could be a
+        # crash mid-batch. Returning a partial map would risk mis-attribution.
+        async def fake_run(*args, timeout):  # noqa: ARG001
+            return 0, "OnlyOneLine\n"
+
+        with mock.patch(
+            "apple_instruments_mcp.analysis.symbolicate._run_capturing", side_effect=fake_run
+        ):
+            result = asyncio.run(
+                atos_resolve(Path("/d"), "", "", ["0x1", "0x2"])
+            )
+        self.assertEqual(result, {})
+
+    def test_drops_batch_when_atos_exits_nonzero(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import atos_resolve
+
+        async def fake_run(*args, timeout):  # noqa: ARG001
+            return 1, "atos: error: invalid binary\n"
+
+        with mock.patch(
+            "apple_instruments_mcp.analysis.symbolicate._run_capturing", side_effect=fake_run
+        ):
+            result = asyncio.run(
+                atos_resolve(Path("/d"), "", "", ["0x1"])
+            )
+        self.assertEqual(result, {})
+
+
+class SymbolizeSamplesEndToEndTests(unittest.TestCase):
+    def _samples(self) -> list:
+        from apple_instruments_mcp.analysis.models import SampleFrame, TimeProfileSample
+
+        # Two samples: one with a raw-address leaf in MyApp, another with the
+        # same raw leaf, and a third where the leaf is already symbolicated
+        # (should be left untouched).
+        f1 = SampleFrame(
+            symbol="0x100001a2b4",
+            binary="MyApp",
+            addr="0x100001a2b4",
+            binary_uuid="UUID-1",
+            binary_load_addr="0x100000000",
+            arch="arm64",
+        )
+        f_named = SampleFrame(symbol="namedFunc", binary="MyApp")
+        return [
+            TimeProfileSample(weight_ns=1_000_000, frames=(f1, f_named)),
+            TimeProfileSample(weight_ns=1_000_000, frames=(f1,)),
+        ]
+
+    def test_resolves_raw_addresses_into_symbol_names(self) -> None:
+        import apple_instruments_mcp.analysis.symbolicate as sym_module
+        from apple_instruments_mcp.analysis.symbolicate import symbolize_samples
+
+        async def fake_run(args0, *rest, timeout):  # noqa: ARG001
+            if args0 == "xcrun":
+                # dwarfdump probe — confirm the UUID
+                return 0, "UUID: UUID-1 (arm64) /path/to/MyApp\n"
+            # atos: one line per input address
+            return 0, "Real.symbol() (in MyApp) (foo.swift:7)\n"
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(sym_module, "_run_capturing", side_effect=fake_run),
+        ):
+            dsym = Path(tmp) / "MyApp.dSYM"
+            inner = dsym / "Contents" / "Resources" / "DWARF"
+            inner.mkdir(parents=True)
+            (inner / "MyApp").write_bytes(b"")
+
+            new_samples, summary = asyncio.run(
+                symbolize_samples(self._samples(), str(dsym))
+            )
+
+        self.assertEqual(summary.resolved, 2)  # the same raw leaf in 2 samples
+        self.assertEqual(summary.unresolved, 0)
+        self.assertEqual(summary.images_with_dsym, 1)
+        # The named frame is unchanged; the raw addr is replaced.
+        leaf_symbols = {s.frames[0].symbol for s in new_samples}
+        self.assertEqual(leaf_symbols, {"Real.symbol()"})
+
+    def test_missing_dsym_path_returns_note_and_no_changes(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import symbolize_samples
+
+        new_samples, summary = asyncio.run(
+            symbolize_samples(self._samples(), "/nonexistent/path.dSYM")
+        )
+
+        self.assertEqual(summary.resolved, 0)
+        self.assertEqual(summary.unresolved, 0)
+        self.assertIn("does not exist", summary.note)
+        # Samples should be untouched
+        self.assertEqual(
+            [s.frames for s in new_samples], [s.frames for s in self._samples()]
+        )
+
+    def test_uuid_mismatch_leaves_frames_raw(self) -> None:
+        import apple_instruments_mcp.analysis.symbolicate as sym_module
+        from apple_instruments_mcp.analysis.symbolicate import symbolize_samples
+
+        async def fake_run(*args, timeout):  # noqa: ARG001
+            # dwarfdump returns a DIFFERENT UUID than what the sample carries
+            return 0, "UUID: OTHER-UUID (arm64) /path\n"
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(sym_module, "_run_capturing", side_effect=fake_run),
+        ):
+            dsym = Path(tmp) / "MyApp.dSYM"
+            inner = dsym / "Contents" / "Resources" / "DWARF"
+            inner.mkdir(parents=True)
+            (inner / "MyApp").write_bytes(b"")
+
+            new_samples, summary = asyncio.run(
+                symbolize_samples(self._samples(), str(dsym))
+            )
+
+        self.assertEqual(summary.resolved, 0)
+        self.assertEqual(summary.images_without_dsym, 1)
+        # Raw leaf remains raw — honest fallback.
+        self.assertEqual(new_samples[0].frames[0].symbol, "0x100001a2b4")
+
+
+class FormatSymbolicationSummaryTests(unittest.TestCase):
+    def test_skipped_when_not_attempted(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import (
+            SymbolicationSummary,
+            format_symbolication_summary,
+        )
+
+        sym = SymbolicationSummary(
+            attempted=False, resolved=0, unresolved=0,
+            images_with_dsym=0, images_without_dsym=0,
+        )
+        self.assertEqual(format_symbolication_summary(sym), "")
+        self.assertEqual(format_symbolication_summary(None), "")
+
+    def test_renders_counts_and_note(self) -> None:
+        from apple_instruments_mcp.analysis.symbolicate import (
+            SymbolicationSummary,
+            format_symbolication_summary,
+        )
+
+        sym = SymbolicationSummary(
+            attempted=True, resolved=12, unresolved=3,
+            images_with_dsym=1, images_without_dsym=2,
+            note="resolved leaf frames from MyApp",
+        )
+        out = format_symbolication_summary(sym)
+        self.assertIn("Symbolication", out)
+        self.assertIn("**12**", out)
+        self.assertIn("**3**", out)
+        self.assertIn("Images without a matching dSYM: 2", out)
+        self.assertIn("resolved leaf frames from MyApp", out)
+
+
 if __name__ == "__main__":
     unittest.main()

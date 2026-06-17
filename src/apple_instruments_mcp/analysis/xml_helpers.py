@@ -70,6 +70,25 @@ def _frame_binary(frame_elem: ET.Element, id_map: dict[str, ET.Element]) -> str:
     return ""
 
 
+def _frame_binary_metadata(
+    frame_elem: ET.Element, id_map: dict[str, ET.Element]
+) -> tuple[str, str, str]:
+    """Extract (uuid, load_addr, arch) from the frame's binary element.
+
+    All three are needed by `symbolicate` to feed `atos`. Empty strings mean
+    the field wasn't on the binary element — typical for traces from older
+    xctrace versions or when symbol tables already named every frame.
+    """
+    binary_child = frame_elem.find("binary")
+    if binary_child is None:
+        return "", "", ""
+    resolved = _resolve(binary_child, id_map)
+    uuid = resolved.get("UUID") or resolved.get("uuid") or ""
+    load_addr = resolved.get("load-addr") or resolved.get("loadAddress") or ""
+    arch = resolved.get("arch") or resolved.get("architecture") or ""
+    return uuid, load_addr, arch
+
+
 def _thread_descriptor(row: ET.Element, id_map: dict[str, ET.Element]) -> tuple[str, bool]:
     """Extract (thread_name, is_main_thread) from a row. xctrace stores thread
     info under various shapes; we look for an explicit name first, then fall
@@ -160,7 +179,17 @@ def parse_time_profile_samples(
             name = frame_resolved.get("name")
             if not name or name == "<deduplicated_symbol>":
                 continue
-            sample_frames.append(SampleFrame(symbol=name, binary=_frame_binary(frame_resolved, id_map)))
+            uuid, load_addr, arch = _frame_binary_metadata(frame_resolved, id_map)
+            sample_frames.append(
+                SampleFrame(
+                    symbol=name,
+                    binary=_frame_binary(frame_resolved, id_map),
+                    addr=frame_resolved.get("addr") or "",
+                    binary_uuid=uuid,
+                    binary_load_addr=load_addr,
+                    arch=arch,
+                )
+            )
 
         if not sample_frames:
             continue

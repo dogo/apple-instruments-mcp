@@ -140,8 +140,9 @@ def _main_thread_stats(
     )
 
 
-def parse_time_profiler(
-    xml_content: str,
+def build_time_profile_analysis(
+    samples: list[TimeProfileSample],
+    total_ms_unscoped: float,
     *,
     total_good_ms: float = 16,
     total_critical_ms: float = 100,
@@ -152,7 +153,11 @@ def parse_time_profiler(
     hang_threshold_ms: int = 250,
     user_binaries: tuple[str, ...] = (),
 ) -> TimeProfileAnalysis:
-    samples, total_ms_unscoped = parse_time_profile_samples(xml_content)
+    """Aggregate pre-parsed samples into a TimeProfileAnalysis.
+
+    Split out of `parse_time_profiler` so the orchestrator can run an async
+    symbolication pass between `parse_time_profile_samples` and aggregation.
+    """
     scoped_samples, scope = _scope_samples(samples, start_ms, end_ms)
     total_ms = (
         sum(s.weight_ns for s in scoped_samples) / _NS_PER_MS
@@ -200,6 +205,33 @@ def parse_time_profiler(
         user_methods=user_methods,
         main_thread=main_thread,
         scope=scope,
+    )
+
+
+def parse_time_profiler(
+    xml_content: str,
+    *,
+    total_good_ms: float = 16,
+    total_critical_ms: float = 100,
+    method_warning_ms: float = 50,
+    method_critical_ms: float = 200,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    hang_threshold_ms: int = 250,
+    user_binaries: tuple[str, ...] = (),
+) -> TimeProfileAnalysis:
+    samples, total_ms_unscoped = parse_time_profile_samples(xml_content)
+    return build_time_profile_analysis(
+        samples,
+        total_ms_unscoped,
+        total_good_ms=total_good_ms,
+        total_critical_ms=total_critical_ms,
+        method_warning_ms=method_warning_ms,
+        method_critical_ms=method_critical_ms,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        hang_threshold_ms=hang_threshold_ms,
+        user_binaries=user_binaries,
     )
 
 

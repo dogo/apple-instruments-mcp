@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TypeVar
 
@@ -14,7 +14,16 @@ from apple_instruments_mcp.analysis.presets import (
     preset_instruments,
 )
 from apple_instruments_mcp.analysis.quality import assess_xml_quality, format_quality
+from apple_instruments_mcp.analysis.symbolicate import (
+    format_symbolication_summary,
+    symbolize_samples,
+)
 from apple_instruments_mcp.analysis.targets import RecordingTarget, format_target_error
+from apple_instruments_mcp.analysis.time_profile import (
+    build_time_profile_analysis,
+    format_time_profiler,
+    has_time_profiler_evidence,
+)
 from apple_instruments_mcp.analysis.xctrace import (
     build_record_command,
     export_xml,
@@ -23,6 +32,7 @@ from apple_instruments_mcp.analysis.xctrace import (
     preflight_ios_target,
     record_trace,
 )
+from apple_instruments_mcp.analysis.xml_helpers import parse_time_profile_samples
 
 T = TypeVar("T")
 
@@ -77,6 +87,7 @@ async def run_analysis(
     keep_trace: bool = False,
     output_dir: str | None = None,
     xpath: str | None = None,
+    async_pipeline: Callable[[str], Awaitable[str]] | None = None,
 ) -> str:
     base_dir = Path(os.path.expanduser(output_dir)) if output_dir else None
     if dry_run:
@@ -131,13 +142,17 @@ async def run_analysis(
         except Exception as exc:
             export_error = str(exc)
         xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
-        result = formatter(parser(xml_content))
+        if async_pipeline is not None:
+            result = await async_pipeline(xml_content)
+        else:
+            result = formatter(parser(xml_content))
         if export_error:
             result = f"{result}\n\n## Export Warning\n- xctrace export failed: {export_error}"
-        quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
-        quality_text = format_quality(quality)
-        if quality_text:
-            result = f"{result}\n{quality_text}"
+        if async_pipeline is None:
+            quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
+            quality_text = format_quality(quality)
+            if quality_text:
+                result = f"{result}\n{quality_text}"
         if keep_trace:
             result = "\n".join(
                 [
@@ -314,6 +329,7 @@ async def analyze_existing(
     evidence_checker: Callable[[str], bool],
     *,
     xpath: str | None = None,
+    async_pipeline: Callable[[str], Awaitable[str]] | None = None,
 ) -> str:
     expanded_trace_path = Path(os.path.expanduser(trace_path))
     if not expanded_trace_path.exists():
@@ -332,11 +348,14 @@ async def analyze_existing(
         except Exception as exc:
             export_error = str(exc)
         xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
-        result = formatter(parser(xml_content))
-        quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
-        quality_text = format_quality(quality)
-        if quality_text:
-            result = f"{result}\n{quality_text}"
+        if async_pipeline is not None:
+            result = await async_pipeline(xml_content)
+        else:
+            result = formatter(parser(xml_content))
+            quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
+            quality_text = format_quality(quality)
+            if quality_text:
+                result = f"{result}\n{quality_text}"
         if export_error:
             result = f"{result}\n\n## Export Warning\n- xctrace export failed: {export_error}"
         return result
@@ -344,6 +363,60 @@ async def analyze_existing(
         return f"Error analyzing trace: {error}"
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def build_time_profile_symbolicated_pipeline(
+    label: str,
+    dsym_path: str,
+    *,
+    total_good_ms: float = 16,
+    total_critical_ms: float = 100,
+    method_warning_ms: float = 50,
+    method_critical_ms: float = 200,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    hang_threshold_ms: int = 250,
+    user_binaries: tuple[str, ...] = (),
+) -> Callable[[str], Awaitable[str]]:
+    """Return an async pipeline that resolves a Time Profiler XML into a
+    formatted report with dSYM-resolved frame names.
+
+    Suitable as the `async_pipeline` argument to `run_analysis` /
+    `analyze_existing`. Inlines symbolication between sample parsing and
+    aggregation so the hot-method list shows resolved symbols instead of raw
+    addresses, then appends a status block reporting resolved / unresolved
+    counts.
+    """
+
+    async def pipeline(xml_content: str) -> str:
+        samples, total_ms_unscoped = parse_time_profile_samples(xml_content)
+        symbolicated, summary = await symbolize_samples(samples, dsym_path)
+        analysis = build_time_profile_analysis(
+            symbolicated,
+            total_ms_unscoped,
+            total_good_ms=total_good_ms,
+            total_critical_ms=total_critical_ms,
+            method_warning_ms=method_warning_ms,
+            method_critical_ms=method_critical_ms,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            hang_threshold_ms=hang_threshold_ms,
+            user_binaries=user_binaries,
+        )
+        body = format_time_profiler(analysis, label)
+        quality = assess_xml_quality(
+            xml_content, has_time_profiler_evidence(xml_content), "time profiler"
+        )
+        quality_text = format_quality(quality)
+        sym_text = format_symbolication_summary(summary)
+        sections = [body]
+        if quality_text:
+            sections.append(quality_text)
+        if sym_text:
+            sections.append(sym_text)
+        return "\n\n".join(s for s in sections if s)
+
+    return pipeline
 
 
 async def compare_existing(

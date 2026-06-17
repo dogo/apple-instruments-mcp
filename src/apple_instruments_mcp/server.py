@@ -15,6 +15,7 @@ from apple_instruments_mcp.analysis import (
     RecordingTarget,
     analyze_existing,
     build_record_command,
+    build_time_profile_symbolicated_pipeline,
     compare_allocation_analyses,
     compare_existing,
     compare_launch_analyses,
@@ -164,6 +165,18 @@ UserBinaries = Annotated[
         description=(
             "Comma-separated binary names that count as 'user code' for the user-methods view "
             "(e.g. `MyApp,MyAppKit`). Empty disables the user-methods section."
+        ),
+    ),
+]
+DsymPath = Annotated[
+    str | None,
+    Field(
+        default=None,
+        description=(
+            "Optional path to a .dSYM bundle (or plain Mach-O) used to resolve raw-address frames "
+            "(release builds with stripped symbols). When set, the report includes a Symbolication "
+            "section with resolved/unresolved counts. Frames whose UUID doesn't match the dSYM are "
+            "left as raw addresses — names are never invented."
         ),
     ),
 ]
@@ -791,6 +804,7 @@ async def analyze_time_profiler(
     scope_end_ms: ScopeEndMs = None,
     hang_threshold_ms: HangThresholdMs = 250,
     user_binaries: UserBinaries = "",
+    dsym_path: DsymPath = None,
 ) -> str:
     """Record a Time Profiler trace and report CPU hot methods."""
     target = make_target(
@@ -803,6 +817,22 @@ async def analyze_time_profiler(
         all_processes=all_processes,
     )
     binaries = _split_user_binaries(user_binaries)
+    pipeline = (
+        build_time_profile_symbolicated_pipeline(
+            target.label,
+            dsym_path,
+            total_good_ms=total_good_ms,
+            total_critical_ms=total_critical_ms,
+            method_warning_ms=method_warning_ms,
+            method_critical_ms=method_critical_ms,
+            start_ms=scope_start_ms,
+            end_ms=scope_end_ms,
+            hang_threshold_ms=hang_threshold_ms,
+            user_binaries=binaries,
+        )
+        if dsym_path
+        else None
+    )
     return await run_analysis(
         "Time Profiler",
         target,
@@ -825,6 +855,7 @@ async def analyze_time_profiler(
         keep_trace=keep_trace,
         output_dir=output_dir,
         xpath=XPATH_TIME_PROFILE,
+        async_pipeline=pipeline,
     )
 
 
@@ -840,9 +871,26 @@ async def analyze_time_profiler_trace(
     scope_end_ms: ScopeEndMs = None,
     hang_threshold_ms: HangThresholdMs = 250,
     user_binaries: UserBinaries = "",
+    dsym_path: DsymPath = None,
 ) -> str:
     """Analyze an existing .trace bundle recorded with the Time Profiler template."""
     binaries = _split_user_binaries(user_binaries)
+    pipeline = (
+        build_time_profile_symbolicated_pipeline(
+            bundle_id,
+            dsym_path,
+            total_good_ms=total_good_ms,
+            total_critical_ms=total_critical_ms,
+            method_warning_ms=method_warning_ms,
+            method_critical_ms=method_critical_ms,
+            start_ms=scope_start_ms,
+            end_ms=scope_end_ms,
+            hang_threshold_ms=hang_threshold_ms,
+            user_binaries=binaries,
+        )
+        if dsym_path
+        else None
+    )
     return await analyze_existing(
         trace_path,
         lambda xml: parse_time_profiler(
@@ -860,6 +908,7 @@ async def analyze_time_profiler_trace(
         "time profiler",
         has_time_profiler_evidence,
         xpath=XPATH_TIME_PROFILE,
+        async_pipeline=pipeline,
     )
 
 

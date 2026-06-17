@@ -54,6 +54,7 @@ from apple_instruments_mcp.analysis.network import (
 )
 from apple_instruments_mcp.analysis.orchestrator import (
     analyze_existing,
+    build_time_profile_symbolicated_pipeline,
     compare_existing,
     run_analysis,
     run_preset_analysis,
@@ -126,6 +127,7 @@ __all__ = [
     "analyze_existing",
     "assess_xml_quality",
     "build_record_command",
+    "build_time_profile_symbolicated_pipeline",
     "compare_allocation_analyses",
     "compare_existing",
     "compare_launch_analyses",
