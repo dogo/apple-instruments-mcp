@@ -95,6 +95,7 @@ Profile com.example.app on this simulator with the full preset for 15 seconds.
 Record an App Launch trace for com.example.app on this iPhone simulator and show the startup offenders.
 Launch /Applications/MyMacApp.app with Time Profiler and show CPU hot methods.
 Time-profile com.example.app, then zoom into the 8000ms–12000ms window and flag main-thread stalls above 200ms.
+Time-profile this release build and symbolicate raw addresses with ~/Build/MyApp.dSYM.
 Attach Allocations to the running process named MyMacApp for 30 seconds.
 Attach Time Profiler to PID 1234.
 Record all processes with Time Profiler for 10 seconds.
@@ -123,8 +124,8 @@ Compare ~/Desktop/baseline.trace and ~/Desktop/candidate.trace for launch regres
 | `analyze_allocations_trace` | Allocations | Analyzes an existing Allocations `.trace`. |
 | `analyze_leaks` | Leaks | Records a Leaks trace and reports exported leak details when available. |
 | `analyze_leaks_trace` | Leaks | Analyzes an existing Leaks `.trace` when leak details are exportable. |
-| `analyze_time_profiler` | Time Profiler | Records CPU samples and reports hot methods. |
-| `analyze_time_profiler_trace` | Time Profiler | Analyzes an existing Time Profiler `.trace`. |
+| `analyze_time_profiler` | Time Profiler | Records CPU samples and reports hot methods. Supports `scope_start_ms`/`scope_end_ms` windowing, main-thread hang detection, user-binary filtering, and `dsym_path` for symbolicating release-build frames. |
+| `analyze_time_profiler_trace` | Time Profiler | Analyzes an existing Time Profiler `.trace`. Same scope/hang/user-binary/dSYM options as `analyze_time_profiler`. |
 | `analyze_network` | Network | Records network requests, latency, transfer sizes, and status codes. |
 | `analyze_network_trace` | Network | Analyzes an existing Network `.trace`. |
 | `compare_launch_traces` | App Launch | Compares two App Launch traces and reports startup deltas. |
