@@ -38,3 +38,32 @@ jobs:
 
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+
+  macos-xctrace-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Verify xctrace integration
+        run: |
+          python - <<'PY'
+          import asyncio
+          from apple_instruments_mcp.analysis import run_command
+
+          output = asyncio.run(
+              run_command("xcrun", "xctrace", "version", timeout=15)
+          )
+          assert "xctrace version" in output.lower(), output
+          print(output.strip())
+          PY

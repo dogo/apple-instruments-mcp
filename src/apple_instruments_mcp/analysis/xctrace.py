@@ -42,42 +42,6 @@ async def run_command(*args: str, timeout: float | None = None) -> str:
     return output
 
 
-async def _quiet_run(*args: str, timeout: float | None = None) -> tuple[int, str]:
-    """Run a command without raising; return (returncode, stdout). On timeout returncode is -1."""
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except TimeoutError:
-        process.kill()
-        await process.wait()
-        return -1, ""
-    return process.returncode if process.returncode is not None else 0, stdout.decode(
-        "utf-8", errors="replace"
-    )
-
-
-async def find_stale_xctrace_pids() -> list[int]:
-    """Return PIDs of running `xctrace` processes (exact name match)."""
-    code, out = await _quiet_run("pgrep", "-x", "xctrace", timeout=2.0)
-    # pgrep exits 0 when matches found, 1 when none, anything else is an error we ignore.
-    if code not in (0, 1):
-        return []
-    return [int(token) for token in out.split() if token.isdigit()]
-
-
-async def kill_stale_xctrace_processes() -> int:
-    """Force-kill any running `xctrace` processes left over from prior runs. Returns count."""
-    pids = await find_stale_xctrace_pids()
-    if not pids:
-        return 0
-    await _quiet_run("kill", "-9", *[str(pid) for pid in pids], timeout=2.0)
-    return len(pids)
-
-
 async def list_devices() -> str:
     return await run_command("xcrun", "xctrace", "list", "devices")
 
@@ -213,7 +177,6 @@ async def record_trace(
     args = build_record_command(
         template, target, time_limit_seconds, output_path, instruments=instruments
     )
-    await kill_stale_xctrace_processes()
     try:
         await _run_record_with_watchdog(args, time_limit_seconds)
     except RuntimeError as exc:
@@ -223,7 +186,6 @@ async def record_trace(
         # ground truth, unless the failure is a wedge (no usable bundle then).
         if not _is_wedge_error(str(exc)) and _trace_bundle_finalized(output_path):
             return
-        await kill_stale_xctrace_processes()
         raise
 
 
@@ -380,7 +342,7 @@ async def probe_xctrace_health() -> PreflightFinding | None:
                 f"`xctrace list devices` did not respond within {int(PREFLIGHT_TIMEOUT_SECONDS)}s.",
                 (
                     "xctrace or its IPC channel appears wedged.",
-                    "Try: `pkill -9 xctrace` then retry.",
+                    "Check `pgrep -fl xctrace` and stop only a hung xctrace process you own, then retry.",
                     "If persistent, open Instruments.app once to reset the tracing layer.",
                 ),
             )

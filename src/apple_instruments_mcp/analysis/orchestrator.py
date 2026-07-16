@@ -129,7 +129,7 @@ async def run_analysis(
     tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
     trace_path = tmp_dir / "trace.trace"
     xml_path = tmp_dir / "export.xml"
-    record_failed = False
+    preserve_tmp_dir = False
 
     try:
         await record_trace(template, target, time_limit_seconds, trace_path)
@@ -154,6 +154,7 @@ async def run_analysis(
             if quality_text:
                 result = f"{result}\n{quality_text}"
         if keep_trace:
+            preserve_tmp_dir = True
             result = "\n".join(
                 [
                     result,
@@ -165,8 +166,8 @@ async def run_analysis(
             )
         return result
     except Exception as error:
-        record_failed = True
         partial_trace = trace_path if trace_path.exists() else None
+        preserve_tmp_dir = partial_trace is not None
         return format_target_error(
             target,
             template,
@@ -175,7 +176,7 @@ async def run_analysis(
             preflight_timings=preflight_timings,
         )
     finally:
-        if not keep_trace and not record_failed:
+        if not preserve_tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -272,7 +273,7 @@ async def run_preset_analysis(
         base_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
     trace_path = tmp_dir / "trace.trace"
-    record_failed = False
+    preserve_tmp_dir = False
 
     try:
         await record_trace(
@@ -298,6 +299,7 @@ async def run_preset_analysis(
                 for title in missing
             )
         if keep_trace:
+            preserve_tmp_dir = True
             sections.extend(
                 [
                     "",
@@ -307,8 +309,8 @@ async def run_preset_analysis(
             )
         return "\n".join(sections)
     except Exception as error:
-        record_failed = True
         partial_trace = trace_path if trace_path.exists() else None
+        preserve_tmp_dir = partial_trace is not None
         return format_target_error(
             target,
             preset_label,
@@ -317,7 +319,7 @@ async def run_preset_analysis(
             preflight_timings=preflight_timings,
         )
     finally:
-        if not keep_trace and not record_failed:
+        if not preserve_tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -369,8 +371,8 @@ def build_time_profile_symbolicated_pipeline(
     label: str,
     dsym_path: str,
     *,
-    total_good_ms: float = 16,
-    total_critical_ms: float = 100,
+    total_good_ms: float = 100,
+    total_critical_ms: float = 500,
     method_warning_ms: float = 50,
     method_critical_ms: float = 200,
     start_ms: int | None = None,

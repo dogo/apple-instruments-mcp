@@ -32,9 +32,7 @@ from apple_instruments_mcp.analysis.xctrace import (
     PreflightFinding,
     _trace_bundle_finalized,
     _watchdog_loop,
-    find_stale_xctrace_pids,
     format_preflight_findings,
-    kill_stale_xctrace_processes,
     preflight_ios_target,
     probe_xctrace_health,
 )
@@ -229,6 +227,20 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("xcrun xctrace record", output)
         self.assertIn("trace.trace", output)
         self.assertIn("/Applications/MyApp.app", output)
+
+    def test_analyze_network_passes_network_export_xpath(self) -> None:
+        from apple_instruments_mcp import server
+
+        run = mock.AsyncMock(return_value="network report")
+        with mock.patch.object(server, "run_analysis", run):
+            output = asyncio.run(server.analyze_network(process_name="MyApp"))
+
+        self.assertEqual(output, "network report")
+        assert run.await_args is not None
+        self.assertEqual(
+            run.await_args.kwargs["xpath"],
+            server.XPATH_NETWORK_CONNECTIONS,
+        )
 
     def test_analysis_quality_reports_empty_xml(self) -> None:
         quality = assess_xml_quality("", False, "time profiler")
@@ -639,6 +651,86 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("-40ms (improvement)", output)
 
 
+class OrchestratorArtifactCleanupTests(unittest.TestCase):
+    def test_run_analysis_removes_empty_temp_directory_after_record_failure(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        async def fail_without_trace(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError("record failed before creating a trace")
+
+        target = RecordingTarget.build(process_name="MyApp")
+        with tempfile.TemporaryDirectory() as parent:
+            tmp_dir = Path(parent) / "run"
+            tmp_dir.mkdir()
+            with (
+                mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_without_trace),
+            ):
+                output = asyncio.run(
+                    orchestrator.run_analysis(
+                        "Time Profiler",
+                        target,
+                        5,
+                        parse_time_profiler,
+                        lambda analysis: format_time_profiler(analysis, target.label),
+                        "time profiler",
+                        has_time_profiler_evidence,
+                    )
+                )
+
+            self.assertIn("record failed before creating a trace", output)
+            self.assertFalse(tmp_dir.exists())
+
+    def test_run_analysis_preserves_a_partial_trace_after_record_failure(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        async def fail_with_trace(template, target, duration, output_path, **kwargs):  # noqa: ARG001
+            output_path.mkdir(parents=True)
+            raise RuntimeError("record failed after creating a trace")
+
+        target = RecordingTarget.build(process_name="MyApp")
+        with tempfile.TemporaryDirectory() as parent:
+            tmp_dir = Path(parent) / "run"
+            tmp_dir.mkdir()
+            with (
+                mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_with_trace),
+            ):
+                output = asyncio.run(
+                    orchestrator.run_analysis(
+                        "Time Profiler",
+                        target,
+                        5,
+                        parse_time_profiler,
+                        lambda analysis: format_time_profiler(analysis, target.label),
+                        "time profiler",
+                        has_time_profiler_evidence,
+                    )
+                )
+
+            self.assertIn("Partial trace bundle preserved", output)
+            self.assertTrue((tmp_dir / "trace.trace").exists())
+
+    def test_preset_removes_empty_temp_directory_after_record_failure(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        async def fail_without_trace(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError("preset failed before creating a trace")
+
+        target = RecordingTarget.build(process_name="MyApp")
+        with tempfile.TemporaryDirectory() as parent:
+            tmp_dir = Path(parent) / "preset"
+            tmp_dir.mkdir()
+            with (
+                mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_without_trace),
+            ):
+                output = asyncio.run(orchestrator.run_preset_analysis("cpu", target, 5))
+
+            self.assertIn("preset failed before creating a trace", output)
+            self.assertFalse(tmp_dir.exists())
+
+
 def _enriched_time_profile_fixture() -> str:
     """Fixture mirroring xctrace's real export shape when start-time, thread,
     and binary attributes are present. Six 50ms samples laid out so the
@@ -712,6 +804,71 @@ def _enriched_time_profile_fixture() -> str:
 
 
 class TimeProfileScopeAndHangsTests(unittest.TestCase):
+    def test_real_xctrace_sample_time_and_thread_fmt_are_parsed(self) -> None:
+        xml = """<?xml version="1.0"?>
+<trace-query-result>
+<node xpath="//time-profile">
+  <schema name="time-profile"/>
+  <row>
+    <sample-time id="T1">100000000</sample-time>
+    <thread id="MAIN" fmt="Main Thread (0x1) (MyApp, pid: 42)"/>
+    <thread-state id="RUN" fmt="Running">Running</thread-state>
+    <weight id="W">100000000</weight>
+    <tagged-backtrace id="TB">
+      <backtrace id="B">
+        <frame id="F" name="Work.run" binary="MyApp"/>
+      </backtrace>
+    </tagged-backtrace>
+  </row>
+  <row>
+    <sample-time id="T2">1000000000</sample-time>
+    <thread ref="MAIN"/>
+    <thread-state ref="RUN"/>
+    <weight ref="W"/>
+    <tagged-backtrace ref="TB"/>
+  </row>
+</node>
+</trace-query-result>"""
+
+        analysis = parse_time_profiler(xml, hang_threshold_ms=5000)
+
+        self.assertEqual(analysis.profile_span_ms, 1000)
+        self.assertEqual(analysis.cpu_ms_per_second, 200)
+        assert analysis.main_thread is not None
+        self.assertEqual(analysis.main_thread.samples, 2)
+
+    def test_cpu_load_includes_a_valid_zero_timestamp(self) -> None:
+        from apple_instruments_mcp.analysis.models import SampleFrame, TimeProfileSample
+        from apple_instruments_mcp.analysis.time_profile import build_time_profile_analysis
+
+        frame = SampleFrame(symbol="Work.run")
+        samples = [
+            TimeProfileSample(time_ns=0, weight_ns=100_000_000, frames=(frame,)),
+            TimeProfileSample(time_ns=900_000_000, weight_ns=100_000_000, frames=(frame,)),
+        ]
+
+        analysis = build_time_profile_analysis(
+            samples,
+            total_ms_unscoped=200,
+            start_ms=0,
+            end_ms=1000,
+        )
+
+        self.assertEqual(analysis.profile_span_ms, 1000)
+        self.assertEqual(analysis.cpu_ms_per_second, 200)
+        assert analysis.scope is not None
+        self.assertEqual(analysis.scope.samples_in_scope, 2)
+
+    def test_cpu_load_is_normalized_by_observed_wall_span(self) -> None:
+        analysis = parse_time_profiler(
+            _enriched_time_profile_fixture(),
+            hang_threshold_ms=5000,
+        )
+
+        self.assertEqual(analysis.profile_span_ms, 4100)
+        self.assertAlmostEqual(analysis.cpu_ms_per_second or 0, 73.2, places=1)
+        self.assertEqual(analysis.status, "warning")
+
     def test_scope_clips_samples_to_window(self) -> None:
         analysis = parse_time_profiler(
             _enriched_time_profile_fixture(),
@@ -792,6 +949,7 @@ class TimeProfileScopeAndHangsTests(unittest.TestCase):
         self.assertIn("Main Thread", output)
         self.assertIn("Top User Methods", output)
         self.assertIn("Hot Methods", output)  # original section still present
+        self.assertIn("Average CPU load", output)
 
     def test_legacy_fixture_without_new_columns_still_parses(self) -> None:
         # The pre-existing minimal fixture has no start-time/thread/binary,
@@ -801,6 +959,8 @@ class TimeProfileScopeAndHangsTests(unittest.TestCase):
 
         self.assertIsNone(analysis.scope)
         self.assertIsNone(analysis.main_thread)
+        self.assertIsNone(analysis.profile_span_ms)
+        self.assertIsNone(analysis.cpu_ms_per_second)
         self.assertEqual(analysis.user_methods, [])
         self.assertGreater(analysis.total_duration_ms, 0)
 
@@ -1121,7 +1281,7 @@ class PreflightIosTargetTests(unittest.TestCase):
         self.assertEqual(len(report.findings), 1)
         self.assertEqual(report.findings[0].severity, "blocker")
         self.assertIn("xctrace list devices", report.findings[0].message)
-        self.assertTrue(any("pkill -9 xctrace" in h for h in report.findings[0].hints))
+        self.assertTrue(any("stop only a hung xctrace process you own" in h for h in report.findings[0].hints))
 
     def test_format_preflight_findings_includes_hints(self) -> None:
         findings = [
@@ -1160,7 +1320,7 @@ class ProbeXctraceHealthTests(unittest.TestCase):
         assert finding is not None
         self.assertEqual(finding.severity, "blocker")
         self.assertIn("xctrace list devices", finding.message)
-        self.assertTrue(any("pkill -9 xctrace" in h for h in finding.hints))
+        self.assertTrue(any("stop only a hung xctrace process you own" in h for h in finding.hints))
         self.assertTrue(any("Instruments.app" in h for h in finding.hints))
 
     def test_returns_warning_on_non_timeout_failure(self) -> None:
@@ -1173,65 +1333,6 @@ class ProbeXctraceHealthTests(unittest.TestCase):
         assert finding is not None
         self.assertEqual(finding.severity, "warning")
         self.assertIn("invalid active developer path", finding.message)
-
-
-class StaleXctraceProcessCleanupTests(unittest.TestCase):
-    def test_find_stale_pids_returns_empty_when_pgrep_finds_none(self) -> None:
-        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
-            return 1, ""  # pgrep exit 1 = no matches
-
-        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
-            pids = asyncio.run(find_stale_xctrace_pids())
-
-        self.assertEqual(pids, [])
-
-    def test_find_stale_pids_parses_pgrep_output(self) -> None:
-        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
-            return 0, "1234\n5678\n"
-
-        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
-            pids = asyncio.run(find_stale_xctrace_pids())
-
-        self.assertEqual(pids, [1234, 5678])
-
-    def test_find_stale_pids_ignores_unexpected_exit_codes(self) -> None:
-        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
-            return -1, ""  # timeout sentinel
-
-        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
-            pids = asyncio.run(find_stale_xctrace_pids())
-
-        self.assertEqual(pids, [])
-
-    def test_kill_stale_returns_zero_when_none_found(self) -> None:
-        calls: list[tuple[str, ...]] = []
-
-        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
-            calls.append(args)
-            return 1, ""  # pgrep finds nothing
-
-        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
-            killed = asyncio.run(kill_stale_xctrace_processes())
-
-        self.assertEqual(killed, 0)
-        self.assertEqual(len(calls), 1)  # pgrep only, no kill issued
-        self.assertEqual(calls[0][0], "pgrep")
-
-    def test_kill_stale_invokes_kill_dash_9_for_found_pids(self) -> None:
-        calls: list[tuple[str, ...]] = []
-
-        async def fake_quiet(*args, **kwargs):  # noqa: ARG001
-            calls.append(args)
-            if args[0] == "pgrep":
-                return 0, "111\n222\n"
-            return 0, ""
-
-        with mock.patch.object(xctrace_module, "_quiet_run", side_effect=fake_quiet):
-            killed = asyncio.run(kill_stale_xctrace_processes())
-
-        self.assertEqual(killed, 2)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1], ("kill", "-9", "111", "222"))
 
 
 def _seed_finalized_trace(trace_path: Path) -> None:
@@ -1274,46 +1375,26 @@ class TraceBundleFinalizedTests(unittest.TestCase):
             self.assertFalse(_trace_bundle_finalized(trace))
 
 
-class RecordTraceCleanupTests(unittest.TestCase):
-    def test_record_trace_sweeps_before_and_after_on_failure(self) -> None:
-        sweep_calls: list[str] = []
-        record_called = False
-
-        async def fake_kill():
-            sweep_calls.append("sweep")
-            return 0
-
-        async def fake_record(*args, **kwargs):  # noqa: ARG001
-            nonlocal record_called
-            record_called = True
-            raise RuntimeError("xctrace started recording but did not finish within 10s + 15s grace.")
-
+class RecordTraceOwnershipTests(unittest.TestCase):
+    def test_record_trace_only_runs_its_owned_watchdog_process(self) -> None:
+        record = mock.AsyncMock(return_value=None)
         target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
 
         with (
-            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
-            mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
+            mock.patch.object(xctrace_module, "_run_record_with_watchdog", record),
             tempfile.TemporaryDirectory() as tmp,
-            self.assertRaises(RuntimeError),
         ):
             asyncio.run(xctrace_module.record_trace("App Launch", target, 10, Path(tmp) / "t.trace"))
 
-        self.assertTrue(record_called)
-        self.assertEqual(sweep_calls, ["sweep", "sweep"])
+        record.assert_awaited_once()
+        assert record.await_args is not None
+        args = record.await_args.args[0]
+        self.assertEqual(args[:3], ["xcrun", "xctrace", "record"])
 
     def test_record_trace_swallows_nonzero_exit_when_bundle_is_finalized(self) -> None:
-        sweep_calls: list[str] = []
-
-        async def fake_kill():
-            sweep_calls.append("sweep")
-            return 0
-
         target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
 
-        with (
-            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
-            tempfile.TemporaryDirectory() as tmp,
-        ):
+        with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "t.trace"
             _seed_finalized_trace(trace_path)
 
@@ -1328,13 +1409,8 @@ class RecordTraceCleanupTests(unittest.TestCase):
             ):
                 asyncio.run(xctrace_module.record_trace("App Launch", target, 10, trace_path))
 
-        self.assertEqual(sweep_calls, ["sweep"])  # no post-failure sweep — treated as success
-
     def test_record_trace_propagates_wedge_even_if_bundle_exists(self) -> None:
         target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
-
-        async def fake_kill():
-            return 0
 
         async def fake_record(*args, **kwargs):  # noqa: ARG001
             raise RuntimeError(
@@ -1342,7 +1418,6 @@ class RecordTraceCleanupTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
             mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
             tempfile.TemporaryDirectory() as tmp,
         ):
@@ -1353,26 +1428,18 @@ class RecordTraceCleanupTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 asyncio.run(xctrace_module.record_trace("App Launch", target, 5, trace_path))
 
-    def test_record_trace_sweeps_only_before_on_success(self) -> None:
-        sweep_calls: list[str] = []
-
-        async def fake_kill():
-            sweep_calls.append("sweep")
-            return 0
-
+    def test_record_trace_propagates_nonzero_exit_without_a_finished_bundle(self) -> None:
         async def fake_record(*args, **kwargs):  # noqa: ARG001
-            return None
+            raise RuntimeError("xctrace exited with status 1")
 
         target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
 
         with (
-            mock.patch.object(xctrace_module, "kill_stale_xctrace_processes", side_effect=fake_kill),
             mock.patch.object(xctrace_module, "_run_record_with_watchdog", side_effect=fake_record),
             tempfile.TemporaryDirectory() as tmp,
+            self.assertRaises(RuntimeError),
         ):
             asyncio.run(xctrace_module.record_trace("App Launch", target, 10, Path(tmp) / "t.trace"))
-
-        self.assertEqual(sweep_calls, ["sweep"])
 
 
 class _FakeStream:
@@ -1539,7 +1606,7 @@ class FormatTargetErrorRecordingWedgeTests(unittest.TestCase):
         self.assertIn("runtime wedge", output)
         self.assertIn("simctl shutdown SIM-123", output)
 
-    def test_never_started_message_suggests_pkill_xctrace(self) -> None:
+    def test_never_started_message_avoids_a_global_xctrace_kill(self) -> None:
         target = RecordingTarget.build(bundle_id="com.example.app", device_id="SIM-123")
 
         output = format_target_error(
@@ -1549,7 +1616,8 @@ class FormatTargetErrorRecordingWedgeTests(unittest.TestCase):
         )
 
         self.assertIn("never reported `Starting recording`", output)
-        self.assertIn("pkill -9 xctrace", output)
+        self.assertIn("stop only a hung xctrace process you own", output)
+        self.assertNotIn("pkill", output)
         self.assertIn("simctl shutdown SIM-123", output)
 
     def test_preflight_timings_are_rendered_when_provided(self) -> None:
@@ -1686,7 +1754,7 @@ class DoctorToolTests(unittest.TestCase):
             return PreflightFinding(
                 "blocker",
                 "`xctrace list devices` did not respond within 5s.",
-                ("Try: `pkill -9 xctrace` then retry.",),
+                ("Stop only a hung xctrace process you own, then retry.",),
             )
 
         with (
@@ -1701,7 +1769,7 @@ class DoctorToolTests(unittest.TestCase):
         self.assertIn("🔴 problems", output)
         self.assertIn("[blocker]", output)
         self.assertIn("did not respond", output)
-        self.assertIn("pkill -9 xctrace", output)
+        self.assertIn("Stop only a hung xctrace process you own", output)
         # A blocker probe is a hard stop — listings must not be queried.
         self.assertEqual(listings_called, {"devices": 0, "templates": 0, "instruments": 0})
 
