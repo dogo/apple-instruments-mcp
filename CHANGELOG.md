@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-07-16
 
 - Fixed `analyze_network` to export the Network Connections XPath instead of the trace table of contents.
 - Stopped force-killing every `xctrace` process on the Mac before recordings. The watchdog now owns and terminates only the child process created for the current request.
