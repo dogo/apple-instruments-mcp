@@ -279,7 +279,7 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 ## Notes
 
 - Temporary `.trace` bundles created by recording tools are cleaned up after each run.
-- A failed recording preserves its partial `.trace` only when xctrace actually created one; empty run directories are removed.
+- A failed recording preserves its partial `.trace` only when it contains non-empty artifacts; empty and zero-byte bundles are removed.
 - The server only terminates the `xctrace` child process it started through its watchdog. It does not sweep unrelated `xctrace` sessions running on the Mac.
 - All analysis is based on the XML exported by `xcrun xctrace export`.
 - Reports include an `Analysis Quality` section when the exported XML is empty or no recognizable data was found for the selected parser. Export failures (for example, an unsupported xpath) are reported under `Export Warning`.

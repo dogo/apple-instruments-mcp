@@ -652,11 +652,14 @@ class AnalysisTests(unittest.TestCase):
 
 
 class OrchestratorArtifactCleanupTests(unittest.TestCase):
-    def test_run_analysis_removes_empty_temp_directory_after_record_failure(self) -> None:
+    def test_run_analysis_removes_empty_trace_bundle_after_record_failure(self) -> None:
         from apple_instruments_mcp.analysis import orchestrator
 
-        async def fail_without_trace(*args, **kwargs):  # noqa: ARG001
-            raise RuntimeError("record failed before creating a trace")
+        async def fail_with_empty_trace(
+            template, target, duration, output_path, **kwargs  # noqa: ARG001
+        ):
+            output_path.mkdir(parents=True)
+            raise RuntimeError("record failed after creating an empty trace")
 
         target = RecordingTarget.build(process_name="MyApp")
         with tempfile.TemporaryDirectory() as parent:
@@ -664,7 +667,7 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
             tmp_dir.mkdir()
             with (
                 mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
-                mock.patch.object(orchestrator, "record_trace", side_effect=fail_without_trace),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_with_empty_trace),
             ):
                 output = asyncio.run(
                     orchestrator.run_analysis(
@@ -678,14 +681,17 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
                     )
                 )
 
-            self.assertIn("record failed before creating a trace", output)
+            self.assertIn("record failed after creating an empty trace", output)
+            self.assertNotIn("Partial trace bundle preserved", output)
             self.assertFalse(tmp_dir.exists())
 
     def test_run_analysis_preserves_a_partial_trace_after_record_failure(self) -> None:
         from apple_instruments_mcp.analysis import orchestrator
 
         async def fail_with_trace(template, target, duration, output_path, **kwargs):  # noqa: ARG001
-            output_path.mkdir(parents=True)
+            run_dir = output_path / "Trace1.run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "partial.perfdata").write_bytes(b"partial trace data")
             raise RuntimeError("record failed after creating a trace")
 
         target = RecordingTarget.build(process_name="MyApp")
@@ -711,11 +717,14 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
             self.assertIn("Partial trace bundle preserved", output)
             self.assertTrue((tmp_dir / "trace.trace").exists())
 
-    def test_preset_removes_empty_temp_directory_after_record_failure(self) -> None:
+    def test_preset_removes_empty_trace_bundle_after_record_failure(self) -> None:
         from apple_instruments_mcp.analysis import orchestrator
 
-        async def fail_without_trace(*args, **kwargs):  # noqa: ARG001
-            raise RuntimeError("preset failed before creating a trace")
+        async def fail_with_empty_trace(
+            template, target, duration, output_path, **kwargs  # noqa: ARG001
+        ):
+            output_path.mkdir(parents=True)
+            raise RuntimeError("preset failed after creating an empty trace")
 
         target = RecordingTarget.build(process_name="MyApp")
         with tempfile.TemporaryDirectory() as parent:
@@ -723,11 +732,12 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
             tmp_dir.mkdir()
             with (
                 mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
-                mock.patch.object(orchestrator, "record_trace", side_effect=fail_without_trace),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_with_empty_trace),
             ):
                 output = asyncio.run(orchestrator.run_preset_analysis("cpu", target, 5))
 
-            self.assertIn("preset failed before creating a trace", output)
+            self.assertIn("preset failed after creating an empty trace", output)
+            self.assertNotIn("Partial trace bundle preserved", output)
             self.assertFalse(tmp_dir.exists())
 
 

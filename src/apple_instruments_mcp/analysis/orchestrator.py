@@ -43,6 +43,23 @@ _UNSUPPORTED_TEMPLATES: dict[str, str] = {
 }
 
 
+def _usable_partial_trace(trace_path: Path) -> Path | None:
+    """Return the trace only when xctrace wrote a non-empty artifact inside it."""
+    try:
+        if trace_path.is_file():
+            return trace_path if trace_path.stat().st_size > 0 else None
+        if not trace_path.is_dir():
+            return None
+        if any(
+            entry.is_file() and entry.stat().st_size > 0
+            for entry in trace_path.rglob("*")
+        ):
+            return trace_path
+    except OSError:
+        return None
+    return None
+
+
 def unsupported_template_report(template_kind: str, target_label: str) -> str:
     """Stable error report for template views without a supported parser."""
     pretty = _UNSUPPORTED_TEMPLATES.get(template_kind, template_kind.title())
@@ -166,7 +183,7 @@ async def run_analysis(
             )
         return result
     except Exception as error:
-        partial_trace = trace_path if trace_path.exists() else None
+        partial_trace = _usable_partial_trace(trace_path)
         preserve_tmp_dir = partial_trace is not None
         return format_target_error(
             target,
@@ -309,7 +326,7 @@ async def run_preset_analysis(
             )
         return "\n".join(sections)
     except Exception as error:
-        partial_trace = trace_path if trace_path.exists() else None
+        partial_trace = _usable_partial_trace(trace_path)
         preserve_tmp_dir = partial_trace is not None
         return format_target_error(
             target,
