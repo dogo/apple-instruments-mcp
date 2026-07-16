@@ -149,7 +149,7 @@ Additional recording arguments:
 - `launch_args`: optional shell-style arguments passed after `launch_path`.
 - `time_limit_seconds`: recording duration, from 5 to 120 seconds. Defaults to 20.
 - `dry_run`: return the generated `xctrace` command without recording.
-- `keep_trace`: keep generated `.trace` and XML artifacts, and include their paths in the report.
+- `keep_trace`: keep the run directory and generated `.trace`/XML artifacts, including on failures, and include their paths in the report.
 - `output_dir`: optional parent directory for generated artifacts. Each run creates a dedicated subdirectory inside it.
 
 Examples:

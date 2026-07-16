@@ -652,6 +652,26 @@ class AnalysisTests(unittest.TestCase):
 
 
 class OrchestratorArtifactCleanupTests(unittest.TestCase):
+    def test_usable_partial_trace_ignores_run_issues_boilerplate(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        for store_is_directory in (False, True):
+            with (
+                self.subTest(store_is_directory=store_is_directory),
+                tempfile.TemporaryDirectory() as parent,
+            ):
+                trace_path = Path(parent) / "trace.trace"
+                run_dir = trace_path / "Trace1.run"
+                run_dir.mkdir(parents=True)
+                run_issues = run_dir / "RunIssues.storedata"
+                if store_is_directory:
+                    run_issues.mkdir()
+                    (run_issues / "issues.db").write_bytes(b"boilerplate")
+                else:
+                    run_issues.write_bytes(b"boilerplate")
+
+                self.assertIsNone(orchestrator._usable_partial_trace(trace_path))
+
     def test_run_analysis_removes_empty_trace_bundle_after_record_failure(self) -> None:
         from apple_instruments_mcp.analysis import orchestrator
 
@@ -717,6 +737,46 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
             self.assertIn("Partial trace bundle preserved", output)
             self.assertTrue((tmp_dir / "trace.trace").exists())
 
+    def test_run_analysis_keep_trace_preserves_failure_artifact_paths(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        async def fail_with_empty_trace(
+            template, target, duration, output_path, **kwargs  # noqa: ARG001
+        ):
+            output_path.mkdir(parents=True)
+            raise RuntimeError("record failed with keep_trace")
+
+        target = RecordingTarget.build(process_name="MyApp")
+        with tempfile.TemporaryDirectory() as parent:
+            tmp_dir = Path(parent) / "run"
+            tmp_dir.mkdir()
+            trace_path = tmp_dir / "trace.trace"
+            xml_path = tmp_dir / "export.xml"
+            with (
+                mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_with_empty_trace),
+            ):
+                output = asyncio.run(
+                    orchestrator.run_analysis(
+                        "Time Profiler",
+                        target,
+                        5,
+                        parse_time_profiler,
+                        lambda analysis: format_time_profiler(analysis, target.label),
+                        "time profiler",
+                        has_time_profiler_evidence,
+                        keep_trace=True,
+                    )
+                )
+
+            self.assertIn("record failed with keep_trace", output)
+            self.assertNotIn("Partial trace bundle preserved", output)
+            self.assertIn("## Artifacts", output)
+            self.assertIn(f"- Run directory: `{tmp_dir}`", output)
+            self.assertIn(f"- Trace: `{trace_path}`", output)
+            self.assertIn(f"- XML export: `{xml_path}` (not created)", output)
+            self.assertTrue(tmp_dir.exists())
+
     def test_preset_removes_empty_trace_bundle_after_record_failure(self) -> None:
         from apple_instruments_mcp.analysis import orchestrator
 
@@ -739,6 +799,46 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
             self.assertIn("preset failed after creating an empty trace", output)
             self.assertNotIn("Partial trace bundle preserved", output)
             self.assertFalse(tmp_dir.exists())
+
+    def test_preset_keep_trace_preserves_failure_artifact_paths(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+        from apple_instruments_mcp.analysis.presets import FAMILY_CPU
+
+        async def fail_with_empty_trace(
+            template, target, duration, output_path, **kwargs  # noqa: ARG001
+        ):
+            output_path.mkdir(parents=True)
+            raise RuntimeError("preset failed with keep_trace")
+
+        target = RecordingTarget.build(process_name="MyApp")
+        with tempfile.TemporaryDirectory() as parent:
+            tmp_dir = Path(parent) / "preset"
+            tmp_dir.mkdir()
+            trace_path = tmp_dir / "trace.trace"
+            xml_path = tmp_dir / f"export-{FAMILY_CPU.key}.xml"
+            with (
+                mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fail_with_empty_trace),
+            ):
+                output = asyncio.run(
+                    orchestrator.run_preset_analysis(
+                        "cpu",
+                        target,
+                        5,
+                        keep_trace=True,
+                    )
+                )
+
+            self.assertIn("preset failed with keep_trace", output)
+            self.assertNotIn("Partial trace bundle preserved", output)
+            self.assertIn("## Artifacts", output)
+            self.assertIn(f"- Run directory: `{tmp_dir}`", output)
+            self.assertIn(f"- Trace: `{trace_path}`", output)
+            self.assertIn(
+                f"- {FAMILY_CPU.section_title} XML export: `{xml_path}` (not created)",
+                output,
+            )
+            self.assertTrue(tmp_dir.exists())
 
 
 def _enriched_time_profile_fixture() -> str:
@@ -868,6 +968,22 @@ class TimeProfileScopeAndHangsTests(unittest.TestCase):
         self.assertEqual(analysis.cpu_ms_per_second, 200)
         assert analysis.scope is not None
         self.assertEqual(analysis.scope.samples_in_scope, 2)
+
+    def test_low_cpu_load_with_ok_hot_method_stays_good(self) -> None:
+        from apple_instruments_mcp.analysis.models import SampleFrame, TimeProfileSample
+        from apple_instruments_mcp.analysis.time_profile import build_time_profile_analysis
+
+        frame = SampleFrame(symbol="Work.run")
+        samples = [
+            TimeProfileSample(time_ns=0, weight_ns=5_000_000, frames=(frame,)),
+            TimeProfileSample(time_ns=995_000_000, weight_ns=5_000_000, frames=(frame,)),
+        ]
+
+        analysis = build_time_profile_analysis(samples, total_ms_unscoped=10)
+
+        self.assertEqual(analysis.cpu_ms_per_second, 10)
+        self.assertEqual(analysis.hot_methods[0].severity, "ok")
+        self.assertEqual(analysis.status, "good")
 
     def test_cpu_load_is_normalized_by_observed_wall_span(self) -> None:
         analysis = parse_time_profiler(

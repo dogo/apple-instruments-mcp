@@ -178,7 +178,9 @@ def _profile_status(
 ) -> Status:
     if cpu_ms_per_second is not None:
         status = get_status(cpu_ms_per_second, total_good_ms, total_critical_ms)
-        if status == "good" and any(method.severity != "good" for method in methods):
+        if status == "good" and any(
+            method.severity in {"warning", "critical"} for method in methods
+        ):
             status = "warning"
     elif any(method.severity == "critical" for method in methods):
         status = "critical"
