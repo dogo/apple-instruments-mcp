@@ -41,6 +41,45 @@ _UNSUPPORTED_TEMPLATES: dict[str, str] = {
     "allocations": "Allocations",
     "leaks": "Leaks",
 }
+_RUN_ISSUES_STORE = "RunIssues.storedata"
+
+
+def _usable_partial_trace(trace_path: Path) -> Path | None:
+    """Return the trace only when xctrace wrote a non-boilerplate payload."""
+    try:
+        if trace_path.is_file():
+            return trace_path if trace_path.stat().st_size > 0 else None
+        if not trace_path.is_dir():
+            return None
+        for entry in trace_path.rglob("*"):
+            if not entry.is_file():
+                continue
+            relative_parts = entry.relative_to(trace_path).parts
+            if _RUN_ISSUES_STORE in relative_parts:
+                continue
+            if entry.stat().st_size > 0:
+                return trace_path
+    except OSError:
+        return None
+    return None
+
+
+def _artifact_lines(
+    trace_path: Path,
+    xml_paths: tuple[tuple[str, Path], ...] = (),
+) -> list[str]:
+    def artifact_line(label: str, path: Path) -> str:
+        suffix = "" if path.exists() else " (not created)"
+        return f"- {label}: `{path}`{suffix}"
+
+    lines = [
+        "",
+        "## Artifacts",
+        f"- Run directory: `{trace_path.parent}`",
+        artifact_line("Trace", trace_path),
+    ]
+    lines.extend(artifact_line(label, path) for label, path in xml_paths)
+    return lines
 
 
 def unsupported_template_report(template_kind: str, target_label: str) -> str:
@@ -129,7 +168,7 @@ async def run_analysis(
     tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
     trace_path = tmp_dir / "trace.trace"
     xml_path = tmp_dir / "export.xml"
-    record_failed = False
+    preserve_tmp_dir = False
 
     try:
         await record_trace(template, target, time_limit_seconds, trace_path)
@@ -154,28 +193,28 @@ async def run_analysis(
             if quality_text:
                 result = f"{result}\n{quality_text}"
         if keep_trace:
+            preserve_tmp_dir = True
             result = "\n".join(
-                [
-                    result,
-                    "",
-                    "## Artifacts",
-                    f"- Trace: `{trace_path}`",
-                    f"- XML export: `{xml_path}`",
-                ]
+                [result, *_artifact_lines(trace_path, (("XML export", xml_path),))]
             )
         return result
     except Exception as error:
-        record_failed = True
-        partial_trace = trace_path if trace_path.exists() else None
-        return format_target_error(
+        partial_trace = _usable_partial_trace(trace_path)
+        preserve_tmp_dir = keep_trace or partial_trace is not None
+        result = format_target_error(
             target,
             template,
             str(error),
             partial_trace=partial_trace,
             preflight_timings=preflight_timings,
         )
+        if keep_trace:
+            result = "\n".join(
+                [result, *_artifact_lines(trace_path, (("XML export", xml_path),))]
+            )
+        return result
     finally:
-        if not keep_trace and not record_failed:
+        if not preserve_tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -272,7 +311,11 @@ async def run_preset_analysis(
         base_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="instruments-mcp-", dir=base_dir))
     trace_path = tmp_dir / "trace.trace"
-    record_failed = False
+    preserve_tmp_dir = False
+    xml_paths = tuple(
+        (f"{family.section_title} XML export", tmp_dir / f"export-{family.key}.xml")
+        for family in families
+    )
 
     try:
         await record_trace(
@@ -282,8 +325,7 @@ async def run_preset_analysis(
         sections: list[str] = [f"# {preset.capitalize()} Profile — {target.label}", ""]
         sections.append(f"**Instruments recorded:** {', '.join(instruments)}")
         missing: list[str] = []
-        for family in families:
-            xml_path = tmp_dir / f"export-{family.key}.xml"
+        for family, (_, xml_path) in zip(families, xml_paths, strict=True):
             section = await _run_family(family, trace_path, xml_path, target.label)
             if section is None:
                 missing.append(family.section_title)
@@ -298,26 +340,24 @@ async def run_preset_analysis(
                 for title in missing
             )
         if keep_trace:
-            sections.extend(
-                [
-                    "",
-                    "## Artifacts",
-                    f"- Trace: `{trace_path}`",
-                ]
-            )
+            preserve_tmp_dir = True
+            sections.extend(_artifact_lines(trace_path, xml_paths))
         return "\n".join(sections)
     except Exception as error:
-        record_failed = True
-        partial_trace = trace_path if trace_path.exists() else None
-        return format_target_error(
+        partial_trace = _usable_partial_trace(trace_path)
+        preserve_tmp_dir = keep_trace or partial_trace is not None
+        result = format_target_error(
             target,
             preset_label,
             str(error),
             partial_trace=partial_trace,
             preflight_timings=preflight_timings,
         )
+        if keep_trace:
+            result = "\n".join([result, *_artifact_lines(trace_path, xml_paths)])
+        return result
     finally:
-        if not keep_trace and not record_failed:
+        if not preserve_tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -369,8 +409,8 @@ def build_time_profile_symbolicated_pipeline(
     label: str,
     dsym_path: str,
     *,
-    total_good_ms: float = 16,
-    total_critical_ms: float = 100,
+    total_good_ms: float = 100,
+    total_critical_ms: float = 500,
     method_warning_ms: float = 50,
     method_critical_ms: float = 200,
     start_ms: int | None = None,

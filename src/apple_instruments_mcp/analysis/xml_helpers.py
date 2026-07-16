@@ -92,12 +92,12 @@ def _frame_binary_metadata(
 def _thread_descriptor(row: ET.Element, id_map: dict[str, ET.Element]) -> tuple[str, bool]:
     """Extract (thread_name, is_main_thread) from a row. xctrace stores thread
     info under various shapes; we look for an explicit name first, then fall
-    back to `tid` 0/1 as a weak signal."""
+    back to the formatted display name."""
     thread_elem = row.find("thread")
     if thread_elem is None:
         return "", False
     resolved = _resolve(thread_elem, id_map)
-    name = resolved.get("name") or ""
+    name = resolved.get("name") or resolved.get("fmt") or ""
     if not name:
         name_child = resolved.find("name")
         if name_child is not None:
@@ -112,17 +112,22 @@ def _thread_descriptor(row: ET.Element, id_map: dict[str, ET.Element]) -> tuple[
     return name, is_main
 
 
-def _start_time_ns(row: ET.Element, id_map: dict[str, ET.Element]) -> int:
-    """`start-time` is exported as integer nanoseconds since the run start.
-    Return 0 when missing — callers treat that as "no timing information"."""
-    elem = row.find("start-time")
+def _sample_time_ns(row: ET.Element, id_map: dict[str, ET.Element]) -> int | None:
+    """Return the sample offset in nanoseconds.
+
+    Current xctrace exports use `sample-time`; older fixtures and some template
+    shapes use `start-time`.
+    """
+    elem = row.find("sample-time")
     if elem is None:
-        return 0
+        elem = row.find("start-time")
+    if elem is None:
+        return None
     resolved = _resolve(elem, id_map)
     try:
         return int((resolved.text or "0").strip())
     except (AttributeError, ValueError):
-        return 0
+        return None
 
 
 def parse_time_profile_samples(
@@ -202,7 +207,7 @@ def parse_time_profile_samples(
             TimeProfileSample(
                 weight_ns=weight,
                 frames=tuple(sample_frames),
-                time_ns=_start_time_ns(row, id_map),
+                time_ns=_sample_time_ns(row, id_map),
                 thread_name=thread_name,
                 is_main_thread=is_main,
             )

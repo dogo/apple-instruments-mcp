@@ -121,8 +121,20 @@ MemoryWarningMb = Annotated[float, Field(ge=0, description="Peak memory above th
 MemoryCriticalMb = Annotated[float, Field(ge=0, description="Peak memory above this value is critical.")]
 MemoryCacheWarningMb = Annotated[float, Field(ge=0, description="Peak memory above this value suggests cache release recommendations.")]
 LeakCriticalCount = Annotated[int, Field(ge=0, description="Leak count above this value is critical.")]
-TotalCpuGoodMs = Annotated[float, Field(ge=0, description="Total profiled CPU duration below this value is good.")]
-TotalCpuCriticalMs = Annotated[float, Field(ge=0, description="Total profiled CPU duration at or above this value is critical.")]
+TotalCpuGoodMs = Annotated[
+    float,
+    Field(
+        ge=0,
+        description="Average CPU load below this many CPU-active milliseconds per wall-clock second is good.",
+    ),
+]
+TotalCpuCriticalMs = Annotated[
+    float,
+    Field(
+        ge=0,
+        description="Average CPU load at or above this many CPU-active milliseconds per wall-clock second is critical.",
+    ),
+]
 MethodWarningMs = Annotated[float, Field(ge=0, description="Hot method self-time above this value is a warning.")]
 MethodCriticalMs = Annotated[float, Field(ge=0, description="Hot method self-time above this value is critical.")]
 RequestWarningMs = Annotated[float, Field(ge=0, description="Request duration above this value is a warning.")]
@@ -796,8 +808,8 @@ async def analyze_time_profiler(
     dry_run: DryRun = False,
     keep_trace: KeepTrace = False,
     output_dir: OutputDir = None,
-    total_good_ms: TotalCpuGoodMs = 16,
-    total_critical_ms: TotalCpuCriticalMs = 100,
+    total_good_ms: TotalCpuGoodMs = 100,
+    total_critical_ms: TotalCpuCriticalMs = 500,
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
     scope_start_ms: ScopeStartMs = None,
@@ -863,8 +875,8 @@ async def analyze_time_profiler(
 async def analyze_time_profiler_trace(
     trace_path: TracePath,
     bundle_id: Annotated[str, Field(description="Target name used in the report.")] = "unknown target",
-    total_good_ms: TotalCpuGoodMs = 16,
-    total_critical_ms: TotalCpuCriticalMs = 100,
+    total_good_ms: TotalCpuGoodMs = 100,
+    total_critical_ms: TotalCpuCriticalMs = 500,
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
     scope_start_ms: ScopeStartMs = None,
@@ -957,6 +969,7 @@ async def analyze_network(
         dry_run=dry_run,
         keep_trace=keep_trace,
         output_dir=output_dir,
+        xpath=XPATH_NETWORK_CONNECTIONS,
     )
 
 
@@ -1046,8 +1059,8 @@ async def compare_cpu_traces(
     baseline_trace_path: BaselineTracePath,
     candidate_trace_path: CandidateTracePath,
     bundle_id: Annotated[str, Field(description="Target name used in the report.")] = "unknown target",
-    total_good_ms: TotalCpuGoodMs = 16,
-    total_critical_ms: TotalCpuCriticalMs = 100,
+    total_good_ms: TotalCpuGoodMs = 100,
+    total_critical_ms: TotalCpuCriticalMs = 500,
     method_warning_ms: MethodWarningMs = 50,
     method_critical_ms: MethodCriticalMs = 200,
 ) -> str:

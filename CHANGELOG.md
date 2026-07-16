@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 - 2026-07-16
+
+- Fixed `analyze_network` to export the Network Connections XPath instead of the trace table of contents.
+- Stopped force-killing every `xctrace` process on the Mac before recordings. The watchdog now owns and terminates only the child process created for the current request.
+- Normalized Time Profiler CPU-active time by the observed wall-clock sample span before assigning overall status. The parser now recognizes xctrace's real `sample-time` and formatted thread fields, reports distinguish cumulative CPU-active time from average CPU load, and no longer claim the main thread is blocked without main-thread evidence.
+- Fixed healthy Time Profiler methods with `ok` severity being incorrectly promoted to an overall warning.
+- Clean up empty temporary run directories, zero-byte `.trace` bundles, and `RunIssues.storedata`-only bundles after failed recordings while continuing to preserve partial traces containing real payloads.
+- Honor `keep_trace=True` on recording failures by preserving the run directory and reporting trace/XML artifact paths even when an artifact was not created.
+- Added a macOS CI smoke test that executes the installed `xcrun xctrace` through the project subprocess wrapper.
+
 ## 1.1.0 - 2026-06-17
 
 - Added two new MCP tools: `doctor` (one-shot xctrace health check with xctrace version/path and device/template/instrument counts) and `profile_preset` (`cpu`/`memory`/`network`/`full` bundles that record multiple instruments in a single trace and report each family that produced data).

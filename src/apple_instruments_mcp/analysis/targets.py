@@ -184,7 +184,9 @@ def format_target_error(
         lines.append("xctrace never reported `Starting recording`.")
         lines.extend(_format_preflight_timings(preflight_timings))
         lines.append("- xctrace itself or its IPC channel appears wedged before the session started.")
-        lines.append("- Try: `pkill -9 xctrace` then retry.")
+        lines.append(
+            "- Check `pgrep -fl xctrace` and stop only a hung xctrace process you own, then retry."
+        )
         if target.bundle_id and target.device_id:
             lines.append(
                 f"- If persistent: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`."
@@ -291,4 +293,5 @@ def format_target_error(
             ]
         )
     lines.append("- Xcode CLI tools missing: `xcode-select --install`.")
+    _append_partial_trace_note(lines, partial_trace)
     return "\n".join(lines)

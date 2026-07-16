@@ -37,12 +37,12 @@ class SampleFrame:
 @dataclass(frozen=True)
 class TimeProfileSample:
     """A single Time Profiler row, leaf-first frames. `time_ns` is the offset
-    from the start of the run; 0 when xctrace's export didn't carry start-time
-    (older fixtures, some templates)."""
+    from the start of the run; `None` when xctrace's export didn't carry
+    sample-time or start-time (older fixtures, some templates)."""
 
     weight_ns: int
     frames: tuple[SampleFrame, ...]
-    time_ns: int = 0
+    time_ns: int | None = None
     thread_name: str = ""
     is_main_thread: bool = False
 
@@ -161,6 +161,8 @@ class TimeProfileAnalysis:
     user_methods: list[HotMethod] = field(default_factory=list)
     main_thread: MainThreadStats | None = None
     scope: ScopeInfo | None = None
+    profile_span_ms: int | None = None
+    cpu_ms_per_second: float | None = None
 
 
 @dataclass(frozen=True)

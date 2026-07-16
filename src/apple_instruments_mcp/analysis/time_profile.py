@@ -6,6 +6,7 @@ from apple_instruments_mcp.analysis.models import (
     HotMethod,
     MainThreadStats,
     ScopeInfo,
+    Status,
     TimeProfileAnalysis,
     TimeProfileSample,
 )
@@ -23,6 +24,7 @@ from apple_instruments_mcp.analysis.xml_helpers import (
 XPATH_TIME_PROFILE = '/trace-toc/run/data/table[@schema="time-profile"]'
 
 _NS_PER_MS = 1_000_000
+_MS_PER_SECOND = 1_000
 
 
 def has_time_profiler_evidence(xml_content: str) -> bool:
@@ -41,7 +43,7 @@ def _scope_samples(
     hi_ms = end_ms if end_ms is not None and end_ms > 0 else 0
     in_scope: list[TimeProfileSample] = []
     for sample in samples:
-        if sample.time_ns <= 0:
+        if sample.time_ns is None:
             # No timestamp on this row — can't tell if it's in scope. Drop it
             # rather than guess; partial-data is worse than fewer samples.
             continue
@@ -117,9 +119,7 @@ def _main_thread_stats(
     threshold = max(hang_threshold_ms, 1)
     main_weight_ns = sum(s.weight_ns for s in main_samples)
 
-    timestamped = sorted(
-        (s.time_ns for s in main_samples if s.time_ns > 0), reverse=False
-    )
+    timestamped = sorted(s.time_ns for s in main_samples if s.time_ns is not None)
     max_gap_ms = 0
     stalls = 0
     for prev, curr in zip(timestamped, timestamped[1:], strict=False):
@@ -140,12 +140,66 @@ def _main_thread_stats(
     )
 
 
+def _cpu_load(
+    samples: list[TimeProfileSample], total_cpu_ms: float
+) -> tuple[int | None, float | None]:
+    """Return observed wall span and normalized CPU-active milliseconds/second.
+
+    Time Profiler weights are cumulative CPU-active time across threads. Comparing
+    that total directly with a frame budget (16ms/100ms) makes longer recordings
+    look critical by construction. When timestamped samples are available, divide
+    cumulative CPU time by the observed wall-clock span instead.
+    """
+    timestamped = [
+        (sample.time_ns, sample.weight_ns)
+        for sample in samples
+        if sample.time_ns is not None
+    ]
+    if len(timestamped) < 2:
+        return None, None
+
+    started_ns = min(time_ns for time_ns, _ in timestamped)
+    finished_ns = max(time_ns + weight_ns for time_ns, weight_ns in timestamped)
+    span_ms = (finished_ns - started_ns) / _NS_PER_MS
+    if span_ms <= 0:
+        return None, None
+
+    cpu_ms_per_second = total_cpu_ms / span_ms * _MS_PER_SECOND
+    return round(span_ms), round(cpu_ms_per_second, 1)
+
+
+def _profile_status(
+    methods: list[HotMethod],
+    main_thread: MainThreadStats | None,
+    cpu_ms_per_second: float | None,
+    *,
+    total_good_ms: float,
+    total_critical_ms: float,
+) -> Status:
+    if cpu_ms_per_second is not None:
+        status = get_status(cpu_ms_per_second, total_good_ms, total_critical_ms)
+        if status == "good" and any(
+            method.severity in {"warning", "critical"} for method in methods
+        ):
+            status = "warning"
+    elif any(method.severity == "critical" for method in methods):
+        status = "critical"
+    elif any(method.severity == "warning" for method in methods):
+        status = "warning"
+    else:
+        status = "good"
+
+    if main_thread is not None and main_thread.candidate_stalls > 0 and status == "good":
+        return "warning"
+    return status
+
+
 def build_time_profile_analysis(
     samples: list[TimeProfileSample],
     total_ms_unscoped: float,
     *,
-    total_good_ms: float = 16,
-    total_critical_ms: float = 100,
+    total_good_ms: float = 100,
+    total_critical_ms: float = 500,
     method_warning_ms: float = 50,
     method_critical_ms: float = 200,
     start_ms: int | None = None,
@@ -175,21 +229,30 @@ def build_time_profile_analysis(
     )
     user_methods = [m for m in all_methods if m.is_user][:15] if binaries else []
 
-    status = get_status(total_ms, total_good_ms, total_critical_ms)
+    profile_span_ms, cpu_ms_per_second = _cpu_load(scoped_samples, total_ms)
+    main_thread = _main_thread_stats(scoped_samples, total_ms, hang_threshold_ms)
+    status = _profile_status(
+        all_methods,
+        main_thread,
+        cpu_ms_per_second,
+        total_good_ms=total_good_ms,
+        total_critical_ms=total_critical_ms,
+    )
     if status == "good":
         summary = "✅ CPU profile looks healthy - no dominant hot methods."
     elif status == "warning":
-        summary = "⚠️ Some methods consuming significant CPU. Review top offenders."
+        summary = "⚠️ CPU load, hot methods, or candidate stalls merit review."
     else:
-        summary = "🔴 Heavy CPU usage detected. Main thread likely blocked - users will feel jank."
+        summary = "🔴 Sustained CPU load or dominant hot methods detected. Investigate before shipping."
 
     recommendations: list[str] = []
     if any(method.severity == "critical" for method in all_methods):
-        recommendations.append("Move critical hot methods off the main thread using async/await or DispatchQueue.")
+        recommendations.append(
+            "Optimize critical hot methods; if they run on the main thread, move suitable work off it."
+        )
     recommendations.append("Use Instruments Time Profiler regularly during UI stress tests.")
     recommendations.append("Target < 16ms per frame (60fps) or < 8ms (120fps ProMotion) for main thread work.")
 
-    main_thread = _main_thread_stats(scoped_samples, total_ms, hang_threshold_ms)
     if main_thread is not None and main_thread.candidate_stalls > 0:
         recommendations.append(
             f"Main thread shows {main_thread.candidate_stalls} gap(s) ≥ {main_thread.gap_threshold_ms}ms — "
@@ -205,14 +268,16 @@ def build_time_profile_analysis(
         user_methods=user_methods,
         main_thread=main_thread,
         scope=scope,
+        profile_span_ms=profile_span_ms,
+        cpu_ms_per_second=cpu_ms_per_second,
     )
 
 
 def parse_time_profiler(
     xml_content: str,
     *,
-    total_good_ms: float = 16,
-    total_critical_ms: float = 100,
+    total_good_ms: float = 100,
+    total_critical_ms: float = 500,
     method_warning_ms: float = 50,
     method_critical_ms: float = 200,
     start_ms: int | None = None,
@@ -251,8 +316,15 @@ def format_time_profiler(analysis: TimeProfileAnalysis, bundle_id: str) -> str:
     lines = [
         f"# Time Profiler - {bundle_id}",
         f"\n{analysis.summary}",
-        f"\n**Duration profiled:** {analysis.total_duration_ms}ms",
+        f"\n**CPU-active time:** {analysis.total_duration_ms}ms",
     ]
+    if analysis.profile_span_ms is not None and analysis.cpu_ms_per_second is not None:
+        one_core_percent = analysis.cpu_ms_per_second / 10
+        lines.append(
+            f"**Observed span:** {analysis.profile_span_ms}ms | "
+            f"**Average CPU load:** {analysis.cpu_ms_per_second:g} CPU-ms/s "
+            f"(~{one_core_percent:.1f}% of one core)"
+        )
     if analysis.scope is not None:
         scope = analysis.scope
         end_text = f"{scope.end_ms}ms" if scope.end_ms else "end"
@@ -311,9 +383,17 @@ def compare_time_profile_analyses(
         f"**Baseline duration:** {baseline.total_duration_ms}ms",
         f"**Candidate duration:** {candidate.total_duration_ms}ms",
         f"**Duration delta:** {format_delta(duration_delta, 'ms')}",
-        "",
-        "## Changed Hot Methods",
     ]
+    if baseline.cpu_ms_per_second is not None and candidate.cpu_ms_per_second is not None:
+        load_delta = round(candidate.cpu_ms_per_second - baseline.cpu_ms_per_second, 1)
+        lines.extend(
+            [
+                f"**Baseline average CPU load:** {baseline.cpu_ms_per_second:g} CPU-ms/s",
+                f"**Candidate average CPU load:** {candidate.cpu_ms_per_second:g} CPU-ms/s",
+                f"**Average CPU load delta:** {format_delta(load_delta, ' CPU-ms/s')}",
+            ]
+        )
+    lines.extend(["", "## Changed Hot Methods"])
     if not changed_methods:
         lines.append("No comparable hot methods found.")
     else:

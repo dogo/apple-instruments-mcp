@@ -64,7 +64,7 @@ The simplest config uses `uvx`, so the client launches the server on demand with
 }
 ```
 
-To pin a specific version, replace the arg with `apple-instruments-mcp@1.1.0`.
+To pin a specific version, replace the arg with `apple-instruments-mcp@1.2.0`.
 
 For Claude Code:
 
@@ -149,7 +149,7 @@ Additional recording arguments:
 - `launch_args`: optional shell-style arguments passed after `launch_path`.
 - `time_limit_seconds`: recording duration, from 5 to 120 seconds. Defaults to 20.
 - `dry_run`: return the generated `xctrace` command without recording.
-- `keep_trace`: keep generated `.trace` and XML artifacts, and include their paths in the report.
+- `keep_trace`: keep the run directory and generated `.trace`/XML artifacts, including on failures, and include their paths in the report.
 - `output_dir`: optional parent directory for generated artifacts. Each run creates a dedicated subdirectory inside it.
 
 Examples:
@@ -200,8 +200,8 @@ Leaks:
 
 Time Profiler:
 
-- `total_good_ms`
-- `total_critical_ms`
+- `total_good_ms` — good threshold for normalized CPU load, measured as CPU-active milliseconds per wall-clock second.
+- `total_critical_ms` — critical threshold for the same normalized CPU-load metric. Defaults of 100/500 correspond to roughly 10%/50% of one fully occupied core.
 - `method_warning_ms`
 - `method_critical_ms`
 
@@ -279,6 +279,8 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 ## Notes
 
 - Temporary `.trace` bundles created by recording tools are cleaned up after each run.
+- A failed recording preserves its partial `.trace` only when it contains non-empty artifacts; empty and zero-byte bundles are removed.
+- The server only terminates the `xctrace` child process it started through its watchdog. It does not sweep unrelated `xctrace` sessions running on the Mac.
 - All analysis is based on the XML exported by `xcrun xctrace export`.
 - Reports include an `Analysis Quality` section when the exported XML is empty or no recognizable data was found for the selected parser. Export failures (for example, an unsupported xpath) are reported under `Export Warning`.
 - If you already have a trace, prefer the `_trace` tools to avoid recording again.
@@ -345,7 +347,7 @@ pyright
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-The package ships a `py.typed` marker so downstream consumers can type-check against its public API. A `uv.lock` is committed for reproducible dependency installs with [uv](https://github.com/astral-sh/uv); CI runs the same checks across Python 3.11–3.13 via `.github/workflows/ci.yml`.
+The package ships a `py.typed` marker so downstream consumers can type-check against its public API. A `uv.lock` is committed for reproducible dependency installs with [uv](https://github.com/astral-sh/uv); CI runs the same checks across Python 3.11–3.13 and includes a macOS smoke test against the installed `xcrun xctrace`.
 
 Run the MCP server locally:
 
