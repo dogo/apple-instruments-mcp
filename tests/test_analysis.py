@@ -843,6 +843,19 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
 
 
 class ExportFailureReportingTests(unittest.TestCase):
+    def test_empty_export_errors_use_a_diagnostic_placeholder(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        analysis_output = orchestrator._format_export_failure("network", " \n")
+        comparison_output = orchestrator._format_comparison_export_failure(
+            "network", (("Baseline", ""),)
+        )
+
+        self.assertIn("- No error details were provided.", analysis_output)
+        self.assertIn(
+            "- Baseline: No error details were provided.", comparison_output
+        )
+
     def test_analyze_existing_does_not_parse_after_export_failure(self) -> None:
         from apple_instruments_mcp.analysis import orchestrator
 

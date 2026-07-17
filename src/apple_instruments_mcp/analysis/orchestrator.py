@@ -83,7 +83,8 @@ def _artifact_lines(
 
 
 def _error_bullet(error: str, *, label: str | None = None) -> str:
-    detail = f"{label}: {error}" if label else error
+    error_detail = error.strip() or "No error details were provided."
+    detail = f"{label}: {error_detail}" if label else error_detail
     indented_detail = detail.replace("\n", "\n  ")
     return f"- {indented_detail}"
 
