@@ -151,23 +151,23 @@ def format_target_error(
     lines = [f"Error profiling with template '{template}' against {target.label}: {error}", ""]
 
     started_but_unfinished = "started recording but did not finish" in msg
+    tap_disconnected = "instruments tap disconnected" in msg
     never_started = "did not begin recording within" in msg
 
-    if started_but_unfinished:
+    if started_but_unfinished or tap_disconnected:
         lines.append(
-            "xctrace launched the target and announced `Starting recording`, but the "
-            "per-instrument tap on the simulator never came up — DTServiceHub/dtsecurity "
-            "completed the launch handshake but stalled before streaming any data."
+            "xctrace reached the recording phase, but the per-instrument tap did not "
+            "stream and finalize data. The DVT/Instruments service path stopped making progress."
         )
         lines.extend(_format_preflight_timings(preflight_timings))
         if target.bundle_id and target.device_id:
             lines.extend(
                 [
-                    "- This is a runtime wedge AFTER the simulator accepted the launch — preflight passed.",
-                    "- The stall is in the Instruments daemon path on the simulator (DTServiceHub or dtsecurity), not in xctrace or the app.",
-                    f"- Reboot the simulator: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
-                    "- If reboot doesn't help: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
-                    "- Last resort: open Instruments.app once to reset the tracing layer.",
+                    "- This is a runtime wedge after the target handshake; it is not evidence of an app performance problem.",
+                    "- Check `xcrun xctrace list devices`: a physical device must be under `Devices`, not `Devices Offline`.",
+                    "- For a physical device, open Xcode (not Instruments), keep it unlocked, and wait for xctrace readiness.",
+                    f"- For a simulator, reboot it: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
+                    "- If a simulator reboot doesn't help: restart CoreSimulatorService, then retry.",
                 ]
             )
         else:
@@ -188,10 +188,12 @@ def format_target_error(
             "- Check `pgrep -fl xctrace` and stop only a hung xctrace process you own, then retry."
         )
         if target.bundle_id and target.device_id:
-            lines.append(
-                f"- If persistent: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`."
+            lines.extend(
+                [
+                    "- For a physical device, open Xcode (not Instruments), keep it unlocked, and wait until `xcrun xctrace list devices` shows it under `Devices`.",
+                    f"- For a simulator: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`.",
+                ]
             )
-        lines.append("- If still failing, open Instruments.app once to reset the tracing layer.")
         _append_partial_trace_note(lines, partial_trace)
         return "\n".join(lines)
 
@@ -201,10 +203,10 @@ def format_target_error(
         if target.bundle_id and target.device_id:
             lines.extend(
                 [
-                    "- Likely a wedged simulator/CoreSimulator service, not a template or app issue.",
-                    f"- Try: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
-                    "- If that doesn't help: `killall -9 com.apple.CoreSimulator.CoreSimulatorService` then retry.",
-                    f"- Verify the app responds: `xcrun simctl get_app_container {target.device_id} {target.bundle_id} app`",
+                    "- Likely a wedged DVT/device service path, not a template or app issue.",
+                    "- For a physical device, confirm xctrace readiness and keep Xcode open while diagnosing.",
+                    f"- For a simulator, try: `xcrun simctl shutdown {target.device_id} && xcrun simctl boot {target.device_id}`",
+                    "- If that doesn't help: restart CoreSimulatorService, then retry.",
                 ]
             )
         else:
