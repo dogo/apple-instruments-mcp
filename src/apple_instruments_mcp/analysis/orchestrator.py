@@ -29,6 +29,7 @@ from apple_instruments_mcp.analysis.xctrace import (
     export_xml,
     format_command,
     format_preflight_findings,
+    preflight_device_target,
     preflight_ios_target,
     record_trace,
 )
@@ -196,8 +197,12 @@ async def run_analysis(
         )
 
     preflight_timings: dict[str, float] | None = None
-    if target.device_id and target.bundle_id:
-        report = await preflight_ios_target(target.device_id, target.bundle_id)
+    if target.device_id:
+        report = (
+            await preflight_ios_target(target.device_id, target.bundle_id)
+            if target.bundle_id
+            else await preflight_device_target(target.device_id)
+        )
         preflight_timings = report.timings
         if report.blockers:
             return format_preflight_findings(template, target.label, report.blockers)
@@ -344,8 +349,12 @@ async def run_preset_analysis(
         )
 
     preflight_timings: dict[str, float] | None = None
-    if target.device_id and target.bundle_id:
-        report = await preflight_ios_target(target.device_id, target.bundle_id)
+    if target.device_id:
+        report = (
+            await preflight_ios_target(target.device_id, target.bundle_id)
+            if target.bundle_id
+            else await preflight_device_target(target.device_id)
+        )
         preflight_timings = report.timings
         if report.blockers:
             return format_preflight_findings(preset_label, target.label, report.blockers)

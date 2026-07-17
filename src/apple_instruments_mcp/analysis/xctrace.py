@@ -432,12 +432,11 @@ async def _probe_xctrace_devices() -> tuple[str | None, PreflightFinding | None]
     return output, None
 
 
-async def preflight_ios_target(device_id: str, bundle_id: str) -> PreflightReport:
-    """Pre-flight an iOS simulator target before xctrace record.
+async def preflight_device_target(device_id: str) -> PreflightReport:
+    """Check whether ``device_id`` is ready for any xctrace recording.
 
-    Returns findings the caller should surface plus per-probe wall-clock timings.
-    Physical devices are also checked against xctrace's own online/offline
-    sections; CoreDevice availability alone is not sufficient for recording.
+    This probe intentionally has no bundle/app assumptions so it also covers
+    device-targeted PID, process-name, and all-process recordings.
     """
     findings: list[PreflightFinding] = []
     timings: dict[str, float] = {}
@@ -450,6 +449,43 @@ async def preflight_ios_target(device_id: str, bundle_id: str) -> PreflightRepor
         findings.append(xctrace_finding)
         if xctrace_finding.severity == "blocker":
             return PreflightReport(findings=findings, timings=timings)
+
+    xctrace_section = (
+        _find_xctrace_target_section(xctrace_output, device_id)
+        if xctrace_output is not None
+        else None
+    )
+    if xctrace_section == "devices_offline":
+        findings.append(
+            PreflightFinding(
+                "blocker",
+                f"`xctrace` sees target {device_id} under `Devices Offline`; "
+                "CoreDevice/devicectl availability does not make it record-ready.",
+                (
+                    "Open Xcode (not Instruments), keep the device unlocked, and wait until it appears under `Devices`.",
+                    "Verify readiness with `xcrun xctrace list devices` before retrying.",
+                    "Opening Instruments.app alone does not establish Xcode's persistent device preparation.",
+                ),
+            )
+        )
+
+    return PreflightReport(findings=findings, timings=timings)
+
+
+async def preflight_ios_target(device_id: str, bundle_id: str) -> PreflightReport:
+    """Pre-flight an iOS simulator target before xctrace record.
+
+    Returns findings the caller should surface plus per-probe wall-clock timings.
+    Physical devices are also checked against xctrace's own online/offline
+    sections; CoreDevice availability alone is not sufficient for recording.
+    """
+    device_report = await preflight_device_target(device_id)
+    findings = list(device_report.findings)
+    timings = dict(device_report.timings)
+    if device_report.blockers:
+        return PreflightReport(findings=findings, timings=timings)
+
+    loop = asyncio.get_running_loop()
 
     started = loop.time()
     try:
@@ -477,26 +513,6 @@ async def preflight_ios_target(device_id: str, bundle_id: str) -> PreflightRepor
     timings["simctl_list_devices"] = loop.time() - started
 
     state = _find_simulator_state(simctl_output, device_id)
-    xctrace_section = (
-        _find_xctrace_target_section(xctrace_output, device_id)
-        if xctrace_output is not None
-        else None
-    )
-    if xctrace_section == "devices_offline":
-        findings.append(
-            PreflightFinding(
-                "blocker",
-                f"`xctrace` sees target {device_id} under `Devices Offline`; "
-                "CoreDevice/devicectl availability does not make it record-ready.",
-                (
-                    "Open Xcode (not Instruments), keep the device unlocked, and wait until it appears under `Devices`.",
-                    "Verify readiness with `xcrun xctrace list devices` before retrying.",
-                    "Opening Instruments.app alone does not establish Xcode's persistent device preparation.",
-                ),
-            )
-        )
-        return PreflightReport(findings=findings, timings=timings)
-
     if state is None:
         # not a simulator (likely physical device); skip simctl checks
         return PreflightReport(findings=findings, timings=timings)

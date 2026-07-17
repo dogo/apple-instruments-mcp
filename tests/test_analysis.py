@@ -30,9 +30,11 @@ from apple_instruments_mcp.analysis import (
 from apple_instruments_mcp.analysis import xctrace as xctrace_module
 from apple_instruments_mcp.analysis.xctrace import (
     PreflightFinding,
+    PreflightReport,
     _trace_bundle_finalized,
     _watchdog_loop,
     format_preflight_findings,
+    preflight_device_target,
     preflight_ios_target,
     probe_xctrace_health,
 )
@@ -663,6 +665,63 @@ Old iPad (17.0) (DEAD-BEEF)
 
         self.assertIn("CPU Trace Comparison", output)
         self.assertIn("-40ms (improvement)", output)
+
+
+class DeviceReadinessOrchestratorTests(unittest.TestCase):
+    def _offline_report(self) -> PreflightReport:
+        return PreflightReport(
+            findings=[
+                PreflightFinding(
+                    "blocker",
+                    "`xctrace` sees target DEVICE-123 under `Devices Offline`.",
+                )
+            ],
+            timings={"xctrace_list_devices": 0.01},
+        )
+
+    def test_run_analysis_preflights_device_target_without_bundle(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        target = RecordingTarget.build(device_id="DEVICE-123", all_processes=True)
+        preflight = mock.AsyncMock(return_value=self._offline_report())
+        record = mock.AsyncMock()
+
+        with (
+            mock.patch.object(orchestrator, "preflight_device_target", preflight),
+            mock.patch.object(orchestrator, "record_trace", record),
+        ):
+            output = asyncio.run(
+                orchestrator.run_analysis(
+                    "Time Profiler",
+                    target,
+                    5,
+                    parse_time_profiler,
+                    lambda analysis: format_time_profiler(analysis, target.label),
+                    "time profiler",
+                    has_time_profiler_evidence,
+                )
+            )
+
+        preflight.assert_awaited_once_with("DEVICE-123")
+        record.assert_not_awaited()
+        self.assertIn("Devices Offline", output)
+
+    def test_run_preset_preflights_device_target_without_bundle(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        target = RecordingTarget.build(device_id="DEVICE-123", all_processes=True)
+        preflight = mock.AsyncMock(return_value=self._offline_report())
+        record = mock.AsyncMock()
+
+        with (
+            mock.patch.object(orchestrator, "preflight_device_target", preflight),
+            mock.patch.object(orchestrator, "record_trace", record),
+        ):
+            output = asyncio.run(orchestrator.run_preset_analysis("cpu", target, 5))
+
+        preflight.assert_awaited_once_with("DEVICE-123")
+        record.assert_not_awaited()
+        self.assertIn("Devices Offline", output)
 
 
 class OrchestratorArtifactCleanupTests(unittest.TestCase):
@@ -1470,6 +1529,22 @@ class PreflightIosTargetTests(unittest.TestCase):
         self.assertIn("devicectl availability", report.findings[0].message)
         self.assertTrue(any("Open Xcode (not Instruments)" in hint for hint in report.findings[0].hints))
 
+    def test_device_only_preflight_blocks_offline_target_without_simctl(self) -> None:
+        device_id = "00008120-0000000000000001"
+        calls: list[tuple[str, ...]] = []
+
+        async def fake(*args, **kwargs):  # noqa: ARG001
+            calls.append(args)
+            return f"== Devices Offline ==\nFixture iPhone (26.5.2) ({device_id})\n"
+
+        with self._patch_run(fake):
+            report = asyncio.run(preflight_device_target(device_id))
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(_is_xctrace_probe(calls[0]))
+        self.assertEqual(len(report.blockers), 1)
+        self.assertIn("Devices Offline", report.blockers[0].message)
+
     def test_blocks_when_simulator_not_booted(self) -> None:
         async def fake(*args, **kwargs):  # noqa: ARG001
             if _is_xctrace_probe(args):
@@ -2101,6 +2176,28 @@ class DoctorToolTests(unittest.TestCase):
         self.assertIn("- **coresimulator**: responsive", output)
         self.assertNotIn("## Problems", output)
 
+    def test_warning_probe_stays_ok_and_renders_nested_hints(self) -> None:
+        async def fake_run(*args, **kwargs):  # noqa: ARG001
+            if "--find" in args:
+                return "/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace\n"
+            return "xctrace version 14.0\n"
+
+        output = self._run_doctor(
+            run_command_side_effect=fake_run,
+            probe_finding=PreflightFinding(
+                "warning",
+                "`xctrace list devices` returned a recoverable warning.",
+                ("Retry after checking the active developer directory.",),
+            ),
+        )
+
+        self.assertIn("✅ ok", output)
+        self.assertIn("## Warnings", output)
+        self.assertNotIn("## Problems", output)
+        self.assertIn("- [warning] `xctrace list devices`", output)
+        self.assertIn("\n  - Retry after checking", output)
+        self.assertNotIn("-   - Retry", output)
+
     def test_offline_devices_are_reported_as_a_warning(self) -> None:
         async def fake_run(*args, **kwargs):  # noqa: ARG001
             if "--find" in args:
@@ -2178,6 +2275,8 @@ class DoctorToolTests(unittest.TestCase):
         self.assertIn("[blocker]", output)
         self.assertIn("did not respond", output)
         self.assertIn("Stop only a hung xctrace process you own", output)
+        self.assertIn("\n  - Stop only a hung xctrace process you own", output)
+        self.assertNotIn("-   - Stop only a hung xctrace process you own", output)
         # A blocker probe is a hard stop — listings must not be queried.
         self.assertEqual(listings_called, {"devices": 0, "templates": 0, "instruments": 0})
 

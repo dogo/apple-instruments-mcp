@@ -326,8 +326,9 @@ async def doctor_report() -> str:
     finding = await probe_xctrace_health()
     if finding is not None:
         marker = "blocker" if finding.severity == "blocker" else "warning"
-        problems.append(f"[{marker}] {finding.message}")
-        problems.extend(f"  - {hint}" for hint in finding.hints)
+        destination = problems if finding.severity == "blocker" else warnings
+        destination.append(f"[{marker}] {finding.message}")
+        destination.extend(f"  - {hint}" for hint in finding.hints)
 
     if finding is None or finding.severity != "blocker":
         for label, fetch in (
@@ -398,10 +399,13 @@ async def doctor_report() -> str:
                 lines.append(f"- **{key}**: {facts[key]}")
     if warnings:
         lines.extend(["", "## Warnings"])
-        lines.extend(f"- {warning}" for warning in warnings)
+        lines.extend(
+            warning if warning.startswith("  - ") else f"- {warning}"
+            for warning in warnings
+        )
     if problems:
         lines.extend(["", "## Problems"])
-        lines.extend(f"- {p}" for p in problems)
+        lines.extend(problem if problem.startswith("  - ") else f"- {problem}" for problem in problems)
     return "\n".join(lines)
 
 
