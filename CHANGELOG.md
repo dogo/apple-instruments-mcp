@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.2.1 - 2026-07-17
 
 - Mark analyses and comparisons as inconclusive when `xctrace export` fails instead of parsing missing or partial XML and potentially reporting false zero activity.
 - Include subprocess exit status or terminating signals such as `SIGSEGV` in `xctrace` command failures.
+- Diagnose physical-device readiness wedges before recording: devices visible to CoreDevice/`devicectl` but listed under `Devices Offline` by `xctrace` now fail fast with Xcode-specific preparation guidance instead of stalling until the watchdog fires.
+- Extended `doctor` with online/offline device counts, CoreSimulator readiness, and sandbox-access diagnostics, so a sandboxed MCP process losing write access to InstrumentsCLI/CoreSimulator state no longer masquerades as a tracing wedge.
+- Fail faster on known Instruments tap disconnections and reduced the recording teardown grace from 60 to 15 seconds.
 
 ## 1.2.0 - 2026-07-16
 
