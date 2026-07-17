@@ -14,12 +14,18 @@ from apple_instruments_mcp.analysis.targets import RecordingTarget
 
 PREFLIGHT_TIMEOUT_SECONDS = 5.0
 RECORD_STARTUP_TIMEOUT_SECONDS = 15.0
-RECORD_TEARDOWN_GRACE_SECONDS = 60.0
+RECORD_TEARDOWN_GRACE_SECONDS = 15.0
 RECORD_POLL_INTERVAL_SECONDS = 0.5
 RECORD_STARTED_MARKER = "starting recording"
 _WEDGE_ERROR_MARKERS = (
     "started recording but did not finish",
     "did not begin recording within",
+    "instruments tap disconnected",
+)
+_TAP_WEDGE_OUTPUT_MARKERS = (
+    "device disconnected while trying to set tap configuration",
+    "device disconnected while trying to start tap",
+    "was not claimed by a tap plug-in",
 )
 
 
@@ -101,6 +107,12 @@ def parse_xctrace_listing(output: str) -> dict[str, list[dict[str, str]]]:
         if not line:
             continue
 
+        equals_header = re.fullmatch(r"==\s*(.+?)\s*==", line)
+        if equals_header is not None:
+            current_section = equals_header.group(1).strip().lower().replace(" ", "_")
+            sections.setdefault(current_section, [])
+            continue
+
         if line.endswith(":") and not line.startswith("-"):
             current_section = line[:-1].strip().lower().replace(" ", "_")
             sections.setdefault(current_section, [])
@@ -117,6 +129,22 @@ def parse_xctrace_listing(output: str) -> dict[str, list[dict[str, str]]]:
         sections.setdefault(current_section, []).append(item)
 
     return sections
+
+
+def _find_xctrace_target_section(output: str, device_id: str) -> str | None:
+    """Return the xctrace listing section containing ``device_id``.
+
+    This distinction matters for physical devices: CoreDevice/devicectl may
+    call a paired device available while xctrace still places it under
+    ``Devices Offline`` and cannot record from it.
+    """
+    target_id = device_id.casefold()
+    for section, items in parse_xctrace_listing(output).items():
+        for item in items:
+            item_id = item.get("id", "").casefold()
+            if item_id == target_id or target_id in item.get("name", "").casefold():
+                return section
+    return None
 
 
 def list_as_json(output: str) -> str:
@@ -265,25 +293,37 @@ async def _watchdog_loop(
     lines: list[str] = []
     started = False
     started_at: float | None = None
+    tap_wedge_line: str | None = None
     loop = asyncio.get_running_loop()
     spawned_at = loop.time()
 
     async def read_lines() -> None:
-        nonlocal started, started_at
+        nonlocal started, started_at, tap_wedge_line
         while True:
             chunk = await stdout.readline()
             if not chunk:
                 return
             text = chunk.decode("utf-8", errors="replace")
             lines.append(text)
+            lowered = text.lower()
             if not started and RECORD_STARTED_MARKER in text.lower():
                 started = True
                 started_at = loop.time()
+            if tap_wedge_line is None and any(
+                marker in lowered for marker in _TAP_WEDGE_OUTPUT_MARKERS
+            ):
+                tap_wedge_line = text.strip()
 
     reader = asyncio.create_task(read_lines())
     try:
         while not reader.done():
             await asyncio.wait({reader}, timeout=poll_interval)
+            if tap_wedge_line is not None:
+                await _terminate(process)
+                raise RuntimeError(
+                    "xctrace Instruments tap disconnected before recording completed. "
+                    f"Last output: {tap_wedge_line}"
+                )
             if reader.done():
                 break
             now = loop.time()
@@ -351,39 +391,60 @@ def _find_simulator_state(simctl_json: str, device_id: str) -> str | None:
 
 async def probe_xctrace_health() -> PreflightFinding | None:
     """Fast probe of the xctrace CLI itself. Returns a blocker if it doesn't respond in time."""
+    _, finding = await _probe_xctrace_devices()
+    return finding
+
+
+async def _probe_xctrace_devices() -> tuple[str | None, PreflightFinding | None]:
+    """Return the device listing together with any xctrace health finding."""
     try:
-        await run_command(
+        output = await run_command(
             "xcrun", "xctrace", "list", "devices", timeout=PREFLIGHT_TIMEOUT_SECONDS
         )
     except RuntimeError as exc:
         message = str(exc)
-        if "timed out" in message.lower():
-            return PreflightFinding(
+        lowered = message.lower()
+        if "timed out" in lowered:
+            return None, PreflightFinding(
                 "blocker",
                 f"`xctrace list devices` did not respond within {int(PREFLIGHT_TIMEOUT_SECONDS)}s.",
                 (
                     "xctrace or its IPC channel appears wedged.",
                     "Check `pgrep -fl xctrace` and stop only a hung xctrace process you own, then retry.",
-                    "If persistent, open Instruments.app once to reset the tracing layer.",
+                    "For a physical device, open Xcode and keep the device unlocked until it appears under `Devices`.",
+                    "Opening Instruments.app alone does not perform Xcode's persistent device preparation.",
                 ),
             )
-        return PreflightFinding("warning", f"`xctrace list devices` failed: {message}")
-    return None
+        if "operation not permitted" in lowered and (
+            "com.apple.dt.instrumentscli" in lowered
+            or "cannot create temporary directory for instruments analysis core" in lowered
+        ):
+            return None, PreflightFinding(
+                "blocker",
+                "`xctrace` cannot write its Instruments CLI state from this process "
+                "(sandbox restriction).",
+                (
+                    "Run the MCP server outside the restrictive sandbox, or grant its process write access to `~/Library/Caches/com.apple.dt.InstrumentsCLI`.",
+                    "This failure occurs before device preparation or recording begins.",
+                ),
+            )
+        return None, PreflightFinding("warning", f"`xctrace list devices` failed: {message}")
+    return output, None
 
 
 async def preflight_ios_target(device_id: str, bundle_id: str) -> PreflightReport:
     """Pre-flight an iOS simulator target before xctrace record.
 
     Returns findings the caller should surface plus per-probe wall-clock timings.
-    Physical devices (not in simctl list) return an empty findings list with whatever
-    probe timings were recorded before the device-type check.
+    Physical devices are also checked against xctrace's own online/offline
+    sections; CoreDevice availability alone is not sufficient for recording.
     """
     findings: list[PreflightFinding] = []
     timings: dict[str, float] = {}
     loop = asyncio.get_running_loop()
 
     started = loop.time()
-    xctrace_finding = await probe_xctrace_health()
+    xctrace_output, xctrace_finding = await _probe_xctrace_devices()
     timings["xctrace_list_devices"] = loop.time() - started
     if xctrace_finding is not None:
         findings.append(xctrace_finding)
@@ -416,9 +477,29 @@ async def preflight_ios_target(device_id: str, bundle_id: str) -> PreflightRepor
     timings["simctl_list_devices"] = loop.time() - started
 
     state = _find_simulator_state(simctl_output, device_id)
+    xctrace_section = (
+        _find_xctrace_target_section(xctrace_output, device_id)
+        if xctrace_output is not None
+        else None
+    )
+    if xctrace_section == "devices_offline":
+        findings.append(
+            PreflightFinding(
+                "blocker",
+                f"`xctrace` sees target {device_id} under `Devices Offline`; "
+                "CoreDevice/devicectl availability does not make it record-ready.",
+                (
+                    "Open Xcode (not Instruments), keep the device unlocked, and wait until it appears under `Devices`.",
+                    "Verify readiness with `xcrun xctrace list devices` before retrying.",
+                    "Opening Instruments.app alone does not establish Xcode's persistent device preparation.",
+                ),
+            )
+        )
+        return PreflightReport(findings=findings, timings=timings)
+
     if state is None:
         # not a simulator (likely physical device); skip simctl checks
-        return PreflightReport(findings=[], timings=timings)
+        return PreflightReport(findings=findings, timings=timings)
 
     if state != "Booted":
         findings.append(

@@ -108,7 +108,7 @@ Compare ~/Desktop/baseline.trace and ~/Desktop/candidate.trace for launch regres
 
 | Tool | Instruments template | Description |
 | --- | --- | --- |
-| `doctor` | - | One-shot health check: xctrace version/path, device/template/instrument counts, and a problems section when probes or listings fail. Run this first if anything looks wedged. |
+| `doctor` | - | One-shot health check: xctrace version/path, online/offline device counts, CoreSimulator access, templates/instruments, and targeted diagnostics for wedges or sandbox failures. Run this first if anything looks wedged. |
 | `list_devices` | - | Lists devices, simulators, runtimes, and host targets visible to `xctrace`. |
 | `list_devices_structured` | - | Returns the device/runtime listing as JSON. |
 | `list_templates` | - | Lists Instruments templates installed on this Mac. |
@@ -281,6 +281,7 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 - Temporary `.trace` bundles created by recording tools are cleaned up after each run.
 - A failed recording preserves its partial `.trace` only when it contains non-empty artifacts; empty and zero-byte bundles are removed.
 - The server only terminates the `xctrace` child process it started through its watchdog. It does not sweep unrelated `xctrace` sessions running on the Mac.
+- Recording teardown has a 15-second grace period after the requested time limit. Known tap-disconnection output aborts immediately instead of leaving an `xctrace` child wedged.
 - All analysis is based on the XML exported by `xcrun xctrace export`.
 - Reports include an `Analysis Quality` section when a successful XML export is empty or contains no recognizable data for the selected parser. Failed exports are reported as `Analysis Inconclusive` under `Export Error`, and the parser is not run against missing or partial XML.
 - If you already have a trace, prefer the `_trace` tools to avoid recording again.
@@ -313,6 +314,7 @@ If recording fails, check these first:
 
 - The target app is installed on the selected simulator or device, or the local launch path exists.
 - The simulator/device is booted and visible in `xcrun xctrace list devices`.
+- A physical device must appear under `Devices`, not `Devices Offline`. `devicectl` reporting it as available only confirms CoreDevice connectivity; it does not prove that `xctrace` can record.
 - The process exists when using `process_name` or `pid`.
 - Xcode and command line tools are selected correctly: `xcode-select -p`.
 - The Instruments template exists on your machine: use `list_templates`.
@@ -326,6 +328,10 @@ You can also verify `xctrace` directly:
 xcrun xctrace list devices
 xcrun xctrace list templates
 ```
+
+For the currently observed physical-device failure mode, open Xcode, keep the device unlocked, and wait until `xcrun xctrace list devices` moves it from `Devices Offline` to `Devices`. Opening Instruments alone does not establish Xcode's persistent device preparation and is not a substitute. The project still treats requiring the Xcode GUI as a toolchain limitation to investigate, not as the desired long-term workflow.
+
+If `doctor` reports a sandbox restriction, run the MCP server outside that sandbox or grant its process access to the reported state directories. `xctrace` currently needs `~/Library/Caches/com.apple.dt.InstrumentsCLI`; simulator diagnostics also need CoreSimulator state, including `~/Library/Logs/CoreSimulator`. These failures happen before target profiling and must be resolved before interpreting a trace wedge.
 
 ## Development
 

@@ -38,6 +38,7 @@ from apple_instruments_mcp.analysis import (
     parse_leaks,
     parse_network,
     parse_time_profiler,
+    parse_xctrace_listing,
     preset_names,
     probe_xctrace_health,
     run_analysis,
@@ -306,6 +307,7 @@ async def doctor_report() -> str:
     decorator wrapper."""
     facts: dict[str, str] = {}
     problems: list[str] = []
+    warnings: list[str] = []
 
     try:
         path = await run_command("xcrun", "--find", "xctrace", timeout=_DOCTOR_PROBE_TIMEOUT_SECONDS)
@@ -336,16 +338,67 @@ async def doctor_report() -> str:
             try:
                 output = await fetch()
                 facts[label] = str(count_xctrace_listing_items(output))
+                if label == "devices":
+                    sections = parse_xctrace_listing(output)
+                    facts["devices_online"] = str(len(sections.get("devices", [])))
+                    facts["devices_offline"] = str(len(sections.get("devices_offline", [])))
+                    facts["simulators"] = str(len(sections.get("simulators", [])))
+                    offline_names = [item["name"] for item in sections.get("devices_offline", [])]
+                    if offline_names:
+                        warnings.append(
+                            "xctrace reports offline target(s): "
+                            + ", ".join(offline_names)
+                            + ". CoreDevice/devicectl availability alone does not make them record-ready."
+                        )
             except Exception as exc:
                 problems.append(f"`xctrace list {label}` failed: {exc}")
+
+    try:
+        await run_command(
+            "xcrun", "simctl", "list", "devices", "-j", timeout=_DOCTOR_PROBE_TIMEOUT_SECONDS
+        )
+        facts["coresimulator"] = "responsive"
+    except Exception as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if "operation not permitted" in lowered or "coresimulatorservice connection" in lowered:
+            detail = next(
+                (
+                    line.strip()
+                    for line in message.splitlines()
+                    if "operation not permitted" in line.lower()
+                    or "coresimulatorservice connection became invalid" in line.lower()
+                ),
+                message.splitlines()[0] if message.splitlines() else message,
+            )
+            problems.append(
+                "CoreSimulator access failed from this MCP process (possible sandbox restriction). "
+                "Run the server outside the restrictive sandbox or grant its process access to CoreSimulator state. "
+                f"Detail: {detail}"
+            )
+        else:
+            problems.append(f"`simctl list devices` failed: {message}")
 
     ok = not problems
     header = "# xctrace doctor — " + ("✅ ok" if ok else "🔴 problems")
     lines = [header, ""]
     if facts:
-        for key in ("xctrace_version", "xctrace_path", "devices", "templates", "instruments"):
+        for key in (
+            "xctrace_version",
+            "xctrace_path",
+            "devices",
+            "devices_online",
+            "devices_offline",
+            "simulators",
+            "templates",
+            "instruments",
+            "coresimulator",
+        ):
             if key in facts:
                 lines.append(f"- **{key}**: {facts[key]}")
+    if warnings:
+        lines.extend(["", "## Warnings"])
+        lines.extend(f"- {warning}" for warning in warnings)
     if problems:
         lines.extend(["", "## Problems"])
         lines.extend(f"- {p}" for p in problems)
@@ -354,10 +407,10 @@ async def doctor_report() -> str:
 
 @mcp.tool()
 async def doctor() -> str:
-    """One-shot health check: xctrace is responsive, what version, where on
-    disk, and how many devices/templates/instruments it can see. Useful as the
-    first call before recording so a wedged toolchain surfaces immediately
-    instead of being discovered through a failed record.
+    """One-shot health check: xctrace responsiveness/version/path, online and
+    offline target counts, CoreSimulator access, and template/instrument
+    availability. Useful before recording so a wedged or sandbox-restricted
+    toolchain surfaces immediately instead of through a failed record.
     """
     return await doctor_report()
 
