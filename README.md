@@ -282,7 +282,7 @@ Warning: `+[AnalyticsSDK configure:]` [post-main]
 - A failed recording preserves its partial `.trace` only when it contains non-empty artifacts; empty and zero-byte bundles are removed.
 - The server only terminates the `xctrace` child process it started through its watchdog. It does not sweep unrelated `xctrace` sessions running on the Mac.
 - All analysis is based on the XML exported by `xcrun xctrace export`.
-- Reports include an `Analysis Quality` section when the exported XML is empty or no recognizable data was found for the selected parser. Export failures (for example, an unsupported xpath) are reported under `Export Warning`.
+- Reports include an `Analysis Quality` section when a successful XML export is empty or contains no recognizable data for the selected parser. Failed exports are reported as `Analysis Inconclusive` under `Export Error`, and the parser is not run against missing or partial XML.
 - If you already have a trace, prefer the `_trace` tools to avoid recording again.
 - Current Xcode versions expect `xcrun xctrace record --output` paths to use the `.trace` extension; `.xctrace` may be rejected before recording starts.
 

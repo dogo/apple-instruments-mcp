@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Mark analyses and comparisons as inconclusive when `xctrace export` fails instead of parsing missing or partial XML and potentially reporting false zero activity.
+- Include subprocess exit status or terminating signals such as `SIGSEGV` in `xctrace` command failures.
+
 ## 1.2.0 - 2026-07-16
 
 - Fixed `analyze_network` to export the Network Connections XPath instead of the trace table of contents.
