@@ -237,6 +237,7 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual(output, "network report")
         assert run.await_args is not None
+        self.assertEqual(run.await_args.args[0], "Network")
         self.assertEqual(
             run.await_args.kwargs["xpath"],
             server.XPATH_NETWORK_CONNECTIONS,
@@ -839,6 +840,137 @@ class OrchestratorArtifactCleanupTests(unittest.TestCase):
                 output,
             )
             self.assertTrue(tmp_dir.exists())
+
+
+class ExportFailureReportingTests(unittest.TestCase):
+    def test_analyze_existing_does_not_parse_after_export_failure(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        parser = mock.Mock(side_effect=AssertionError("parser must not run"))
+        formatter = mock.Mock(side_effect=AssertionError("formatter must not run"))
+        evidence_checker = mock.Mock(side_effect=AssertionError("evidence checker must not run"))
+
+        with tempfile.TemporaryDirectory() as parent:
+            trace_path = Path(parent) / "network.trace"
+            trace_path.mkdir()
+            with mock.patch.object(
+                orchestrator,
+                "export_xml",
+                side_effect=RuntimeError(
+                    "Command terminated by signal SIGSEGV (11): xcrun xctrace export"
+                ),
+            ):
+                output = asyncio.run(
+                    orchestrator.analyze_existing(
+                        str(trace_path),
+                        parser,
+                        formatter,
+                        "network",
+                        evidence_checker,
+                        xpath="/network",
+                    )
+                )
+
+        self.assertIn("# Network Analysis Inconclusive", output)
+        self.assertIn("No performance conclusions were generated", output)
+        self.assertIn("SIGSEGV (11)", output)
+        self.assertNotIn("No network activity found", output)
+        parser.assert_not_called()
+        formatter.assert_not_called()
+        evidence_checker.assert_not_called()
+
+    def test_run_analysis_does_not_parse_after_export_failure(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        async def fake_record(
+            template, target, duration, output_path, **kwargs  # noqa: ARG001
+        ):
+            run_dir = output_path / "Trace1.run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "core.perfdata").write_bytes(b"trace data")
+
+        parser = mock.Mock(side_effect=AssertionError("parser must not run"))
+        formatter = mock.Mock(side_effect=AssertionError("formatter must not run"))
+        evidence_checker = mock.Mock(side_effect=AssertionError("evidence checker must not run"))
+        target = RecordingTarget.build(process_name="MyApp")
+
+        with tempfile.TemporaryDirectory() as parent:
+            tmp_dir = Path(parent) / "run"
+            tmp_dir.mkdir()
+            with (
+                mock.patch.object(orchestrator.tempfile, "mkdtemp", return_value=str(tmp_dir)),
+                mock.patch.object(orchestrator, "record_trace", side_effect=fake_record),
+                mock.patch.object(
+                    orchestrator,
+                    "export_xml",
+                    side_effect=RuntimeError("xctrace export crashed"),
+                ),
+            ):
+                output = asyncio.run(
+                    orchestrator.run_analysis(
+                        "Network",
+                        target,
+                        5,
+                        parser,
+                        formatter,
+                        "network",
+                        evidence_checker,
+                        keep_trace=True,
+                        xpath="/network",
+                    )
+                )
+
+            self.assertIn("# Network Analysis Inconclusive", output)
+            self.assertIn("## Export Error", output)
+            self.assertIn("xctrace export crashed", output)
+            self.assertIn("## Artifacts", output)
+            self.assertIn(f"- Trace: `{tmp_dir / 'trace.trace'}`", output)
+            self.assertIn(
+                f"- XML export: `{tmp_dir / 'export.xml'}` (not created)", output
+            )
+            self.assertTrue(tmp_dir.exists())
+
+        parser.assert_not_called()
+        formatter.assert_not_called()
+        evidence_checker.assert_not_called()
+
+    def test_compare_existing_does_not_compare_after_export_failure(self) -> None:
+        from apple_instruments_mcp.analysis import orchestrator
+
+        parser = mock.Mock(side_effect=AssertionError("parser must not run"))
+        comparator = mock.Mock(side_effect=AssertionError("comparator must not run"))
+        evidence_checker = mock.Mock(side_effect=AssertionError("evidence checker must not run"))
+
+        with tempfile.TemporaryDirectory() as parent:
+            baseline = Path(parent) / "baseline.trace"
+            candidate = Path(parent) / "candidate.trace"
+            baseline.mkdir()
+            candidate.mkdir()
+
+            async def fake_export(trace_path, output_path, **kwargs):  # noqa: ARG001
+                if trace_path == baseline:
+                    raise RuntimeError("baseline export crashed")
+                output_path.write_text(_time_profile_fixture(), encoding="utf-8")
+
+            with mock.patch.object(orchestrator, "export_xml", side_effect=fake_export):
+                output = asyncio.run(
+                    orchestrator.compare_existing(
+                        str(baseline),
+                        str(candidate),
+                        parser,
+                        comparator,
+                        "time profiler",
+                        evidence_checker,
+                        xpath="/time-profile",
+                    )
+                )
+
+        self.assertIn("# Time Profiler Trace Comparison Inconclusive", output)
+        self.assertIn("Baseline: baseline export crashed", output)
+        self.assertIn("No regression or improvement conclusions", output)
+        parser.assert_not_called()
+        comparator.assert_not_called()
+        evidence_checker.assert_not_called()
 
 
 def _enriched_time_profile_fixture() -> str:
@@ -1459,6 +1591,36 @@ class ProbeXctraceHealthTests(unittest.TestCase):
         assert finding is not None
         self.assertEqual(finding.severity, "warning")
         self.assertIn("invalid active developer path", finding.message)
+
+
+class RunCommandFailureTests(unittest.TestCase):
+    def _run_failure(self, returncode: int, output: bytes = b"") -> RuntimeError:
+        process = mock.Mock()
+        process.returncode = returncode
+        process.communicate = mock.AsyncMock(return_value=(output, None))
+
+        with (
+            mock.patch.object(
+                xctrace_module.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(return_value=process),
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            asyncio.run(xctrace_module.run_command("xcrun", "xctrace", "export"))
+        return raised.exception
+
+    def test_reports_terminating_signal_when_command_crashes(self) -> None:
+        error = self._run_failure(-11)
+
+        self.assertIn("terminated by signal SIGSEGV (11)", str(error))
+        self.assertIn("xcrun xctrace export", str(error))
+
+    def test_reports_nonzero_exit_status_alongside_command_output(self) -> None:
+        error = self._run_failure(53, b"output must be a directory\n")
+
+        self.assertIn("exited with status 53", str(error))
+        self.assertIn("output must be a directory", str(error))
 
 
 def _seed_finalized_trace(trace_path: Path) -> None:

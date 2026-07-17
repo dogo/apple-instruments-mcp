@@ -82,6 +82,44 @@ def _artifact_lines(
     return lines
 
 
+def _error_bullet(error: str, *, label: str | None = None) -> str:
+    detail = f"{label}: {error}" if label else error
+    indented_detail = detail.replace("\n", "\n  ")
+    return f"- {indented_detail}"
+
+
+def _format_export_failure(parser_name: str, error: str) -> str:
+    analysis_name = parser_name.replace("_", " ").title()
+    return "\n".join(
+        [
+            f"# {analysis_name} Analysis Inconclusive",
+            "",
+            "`xctrace` failed to export the data required by this parser.",
+            "No performance conclusions were generated from this trace.",
+            "",
+            "## Export Error",
+            _error_bullet(error),
+        ]
+    )
+
+
+def _format_comparison_export_failure(
+    parser_name: str, failures: tuple[tuple[str, str], ...]
+) -> str:
+    analysis_name = parser_name.replace("_", " ").title()
+    return "\n".join(
+        [
+            f"# {analysis_name} Trace Comparison Inconclusive",
+            "",
+            "`xctrace` failed to export one or more traces required for comparison.",
+            "No regression or improvement conclusions were generated.",
+            "",
+            "## Export Errors",
+            *(_error_bullet(error, label=label) for label, error in failures),
+        ]
+    )
+
+
 def unsupported_template_report(template_kind: str, target_label: str) -> str:
     """Stable error report for template views without a supported parser."""
     pretty = _UNSUPPORTED_TEMPLATES.get(template_kind, template_kind.title())
@@ -172,21 +210,24 @@ async def run_analysis(
 
     try:
         await record_trace(template, target, time_limit_seconds, trace_path)
-        export_error: str | None = None
         try:
             if xpath:
                 await export_xml(trace_path, xml_path, xpath=xpath)
             else:
                 await export_xml(trace_path, xml_path, toc=True)
         except Exception as exc:
-            export_error = str(exc)
+            result = _format_export_failure(parser_name, str(exc))
+            if keep_trace:
+                preserve_tmp_dir = True
+                result = "\n".join(
+                    [result, *_artifact_lines(trace_path, (("XML export", xml_path),))]
+                )
+            return result
         xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
         if async_pipeline is not None:
             result = await async_pipeline(xml_content)
         else:
             result = formatter(parser(xml_content))
-        if export_error:
-            result = f"{result}\n\n## Export Warning\n- xctrace export failed: {export_error}"
         if async_pipeline is None:
             quality = assess_xml_quality(xml_content, evidence_checker(xml_content), parser_name)
             quality_text = format_quality(quality)
@@ -233,7 +274,8 @@ async def _run_family(
     except Exception as exc:
         return (
             f"## {family.section_title}\n"
-            f"- xctrace export failed: {exc}"
+            "**Status:** Inconclusive\n"
+            f"{_error_bullet(f'xctrace export failed: {exc}')}"
         )
     xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
     if not family.evidence_checker(xml_content):
@@ -379,14 +421,13 @@ async def analyze_existing(
     xml_path = tmp_dir / "export.xml"
 
     try:
-        export_error: str | None = None
         try:
             if xpath:
                 await export_xml(expanded_trace_path, xml_path, xpath=xpath)
             else:
                 await export_xml(expanded_trace_path, xml_path, toc=True)
         except Exception as exc:
-            export_error = str(exc)
+            return _format_export_failure(parser_name, str(exc))
         xml_content = xml_path.read_text(encoding="utf-8") if xml_path.exists() else ""
         if async_pipeline is not None:
             result = await async_pipeline(xml_content)
@@ -396,8 +437,6 @@ async def analyze_existing(
             quality_text = format_quality(quality)
             if quality_text:
                 result = f"{result}\n{quality_text}"
-        if export_error:
-            result = f"{result}\n\n## Export Warning\n- xctrace export failed: {export_error}"
         return result
     except Exception as error:
         return f"Error analyzing trace: {error}"
@@ -494,6 +533,17 @@ async def compare_existing(
         baseline_export_error = await _export(baseline_path, baseline_xml_path)
         candidate_export_error = await _export(candidate_path, candidate_xml_path)
 
+        export_failures = tuple(
+            (label, error)
+            for label, error in (
+                ("Baseline", baseline_export_error),
+                ("Candidate", candidate_export_error),
+            )
+            if error is not None
+        )
+        if export_failures:
+            return _format_comparison_export_failure(parser_name, export_failures)
+
         baseline_xml = baseline_xml_path.read_text(encoding="utf-8") if baseline_xml_path.exists() else ""
         candidate_xml = candidate_xml_path.read_text(encoding="utf-8") if candidate_xml_path.exists() else ""
         result = comparator(parser(baseline_xml), parser(candidate_xml))
@@ -504,11 +554,6 @@ async def compare_existing(
         if warnings:
             result = f"{result}\n{format_quality(AnalysisQuality(confidence='low', warnings=warnings))}"
 
-        export_errors = [error for error in (baseline_export_error, candidate_export_error) if error]
-        if export_errors:
-            lines = ["", "## Export Warning"]
-            lines.extend(f"- xctrace export failed: {error}" for error in export_errors)
-            result = f"{result}\n" + "\n".join(lines)
         return result
     except Exception as error:
         return f"Error comparing traces: {error}"

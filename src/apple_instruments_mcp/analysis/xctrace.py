@@ -5,6 +5,7 @@ import contextlib
 import json
 import re
 import shlex
+import signal
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,26 @@ _WEDGE_ERROR_MARKERS = (
     "started recording but did not finish",
     "did not begin recording within",
 )
+
+
+def _command_failure_message(
+    args: tuple[str, ...], returncode: int | None, output: str
+) -> str:
+    if returncode is None:
+        outcome = "failed without reporting an exit status"
+    elif returncode < 0:
+        signal_number = -returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = "UNKNOWN"
+        outcome = f"terminated by signal {signal_name} ({signal_number})"
+    else:
+        outcome = f"exited with status {returncode}"
+
+    message = f"Command {outcome}: {shlex.join(args)}"
+    detail = output.strip()
+    return f"{message}\n{detail}" if detail else message
 
 
 async def run_command(*args: str, timeout: float | None = None) -> str:
@@ -38,7 +59,7 @@ async def run_command(*args: str, timeout: float | None = None) -> str:
 
     output = stdout.decode("utf-8", errors="replace")
     if process.returncode != 0:
-        raise RuntimeError(output.strip() or f"Command failed: {' '.join(args)}")
+        raise RuntimeError(_command_failure_message(args, process.returncode, output))
     return output
 
 
